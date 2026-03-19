@@ -112,7 +112,7 @@ func (lf *LiveFlow) RunLive(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lf.senderLoop(cancelCtx, conn, queue, acm, eventCh)
+			lf.senderLoop(cancelCtx, ctx, conn, queue, acm, eventCh)
 			// Close connection when sender is done (queue closed or error).
 			// This unblocks the receiver's conn.Receive without cancelling
 			// the context used by in-flight tool calls.
@@ -187,6 +187,7 @@ func (lf *LiveFlow) sendHistory(
 // On queue.Done(), it drains any remaining buffered messages before returning.
 func (lf *LiveFlow) senderLoop(
 	ctx context.Context,
+	invCtx agent.InvocationContext,
 	conn model.LiveConnection,
 	queue *agent.LiveRequestQueue,
 	acm *AudioCacheManager,
@@ -196,7 +197,11 @@ func (lf *LiveFlow) senderLoop(
 		if acm == nil || req.RealtimeInput == nil || req.RealtimeInput.Audio == nil {
 			return
 		}
-		acm.CacheAudio(req.RealtimeInput.Audio.Data, req.RealtimeInput.Audio.MIMEType, CacheInput)
+		if acm.CacheAudio(req.RealtimeInput.Audio.Data, req.RealtimeInput.Audio.MIMEType, CacheInput) {
+			if ev := acm.FlushInput(ctx, invCtx); ev != nil {
+				sendEvent(ctx, eventCh, eventOrError{event: ev})
+			}
+		}
 	}
 
 	for {
@@ -355,11 +360,15 @@ func (lf *LiveFlow) processMessage(
 		}
 	}
 
-	// Cache output audio for blob persistence.
+	// Cache output audio for blob persistence; flush early if size limit hit.
 	if isAudio && acm != nil && resp.Content != nil {
 		for _, part := range resp.Content.Parts {
 			if part.InlineData != nil {
-				acm.CacheAudio(part.InlineData.Data, part.InlineData.MIMEType, CacheOutput)
+				if acm.CacheAudio(part.InlineData.Data, part.InlineData.MIMEType, CacheOutput) {
+					if ev := acm.FlushOutput(ctx, invCtx); ev != nil {
+						sendEvent(ctx, eventCh, eventOrError{event: ev})
+					}
+				}
 			}
 		}
 	}

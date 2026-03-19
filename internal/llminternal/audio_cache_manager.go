@@ -126,17 +126,6 @@ func (m *AudioCacheManager) flush(ctx context.Context, invCtx agent.InvocationCo
 	if invCtx != nil {
 		artifacts = invCtx.Artifacts()
 	}
-	if artifacts != nil {
-		name := fmt.Sprintf("live_audio_%s_%s_%d", invCtx.InvocationID(), cacheType, seq)
-		if _, err := artifacts.Save(ctx, name, part); err == nil {
-			// Replace inline data with a reference to the artifact.
-			part = &genai.Part{
-				Text: fmt.Sprintf("[audio artifact: %s]", name),
-			}
-		}
-		// On save failure, fall through and embed inline data directly.
-	}
-
 	role := "model"
 	author := ""
 	invocationID := ""
@@ -156,6 +145,23 @@ func (m *AudioCacheManager) flush(ctx context.Context, invCtx agent.InvocationCo
 	ev := session.NewEvent(invocationID)
 	ev.Author = author
 	ev.Branch = branch
+
+	if artifacts != nil {
+		name := fmt.Sprintf("live_audio_%s_%s_%d", invocationID, cacheType, seq)
+		saveResp, err := artifacts.Save(ctx, name, part)
+		if err == nil {
+			// Replace inline data with a FileData reference to the artifact.
+			part = &genai.Part{
+				FileData: &genai.FileData{
+					FileURI:  fmt.Sprintf("artifact://%s", name),
+					MIMEType: mimeType,
+				},
+			}
+			ev.Actions.ArtifactDelta[name] = saveResp.Version
+		}
+		// On save failure, fall through and embed inline data directly.
+	}
+
 	ev.LLMResponse = model.LLMResponse{
 		Content: &genai.Content{
 			Role:  role,
