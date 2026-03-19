@@ -48,6 +48,9 @@ type RunConfig struct {
 	OutputAudioTranscription bool
 	ToolCoalesceWindow       time.Duration // default 150ms if zero
 	LiveBufferSize           int           // default 100 if zero
+	// Proactivity configures proactive audio behavior for live sessions,
+	// allowing the model to decide whether to respond to audio input.
+	Proactivity *genai.ProactivityConfig
 	// Generation parameters — applied to the live session config when set.
 	ThinkingConfig  *genai.ThinkingConfig
 	Temperature     *float32

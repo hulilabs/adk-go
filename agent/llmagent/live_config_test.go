@@ -40,6 +40,25 @@ func TestLiveConfigFromRunConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("proactivity_mapped", func(t *testing.T) {
+		proactive := true
+		rc := &agent.RunConfig{
+			Proactivity: &genai.ProactivityConfig{
+				ProactiveAudio: &proactive,
+			},
+		}
+
+		got := liveConfigFromRunConfig(rc)
+		want := &genai.LiveConnectConfig{
+			Proactivity: &genai.ProactivityConfig{
+				ProactiveAudio: &proactive,
+			},
+		}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Errorf("mismatch (-want +got):\n%s", diff)
+		}
+	})
+
 	t.Run("all_generation_params_mapped", func(t *testing.T) {
 		temp := float32(0.7)
 		topP := float32(0.9)
