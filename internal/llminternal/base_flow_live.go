@@ -29,6 +29,7 @@ import (
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/agent"
+	"google.golang.org/adk/internal/agent/parentmap"
 	"google.golang.org/adk/internal/toolinternal"
 	"google.golang.org/adk/model"
 	"google.golang.org/adk/session"
@@ -128,7 +129,13 @@ func (lf *LiveFlow) RunLive(
 			close(eventCh)
 		}()
 
+		var transferTarget string
 		for msg := range eventCh {
+			// Detect agent transfer signal.
+			if msg.event != nil && msg.event.Actions.TransferToAgent != "" {
+				transferTarget = msg.event.Actions.TransferToAgent
+				break
+			}
 			if !yield(msg.event, msg.err) {
 				break
 			}
@@ -137,7 +144,38 @@ func (lf *LiveFlow) RunLive(
 		cancel()
 		_ = conn.Close()
 		wg.Wait()
+
+		if transferTarget != "" {
+			delay := time.Second
+			if rc := ctx.RunConfig(); rc != nil && rc.TransferAgentDelay > 0 {
+				delay = rc.TransferAgentDelay
+			}
+			time.Sleep(delay)
+
+			nextAgent := agentToRunLive(ctx, transferTarget)
+			if nextAgent == nil {
+				yield(nil, fmt.Errorf("transfer target agent %q not found", transferTarget))
+				return
+			}
+			for ev, err := range nextAgent.Run(ctx) {
+				if !yield(ev, err) || err != nil {
+					return
+				}
+			}
+		}
 	}
+}
+
+// agentToRunLive looks up a transfer target agent from the parent map.
+func agentToRunLive(ctx agent.InvocationContext, agentName string) agent.Agent {
+	parents := parentmap.FromContext(ctx)
+	agents := TransferTargets(ctx.Agent(), parents[ctx.Agent().Name()])
+	for _, a := range agents {
+		if a.Name() == agentName {
+			return a
+		}
+	}
+	return nil
 }
 
 func (lf *LiveFlow) sendHistory(
@@ -462,6 +500,30 @@ func (lf *LiveFlow) flushToolCalls(
 
 	if len(responses) == 0 {
 		return
+	}
+
+	// Check for transfer_to_agent: intercept the transfer response and emit
+	// a transfer event instead of sending it back to the model.
+	for _, r := range responses {
+		if r.Name == "transfer_to_agent" {
+			target, _ := r.Response["agent_name"].(string)
+			if target == "" {
+				// Fall back: check if the tool set TransferToAgent on the response map.
+				// The TransferToAgentTool.Run sets ctx.Actions().TransferToAgent,
+				// but we can also check the response directly.
+				if t, ok := r.Response["transfer_to_agent"].(string); ok {
+					target = t
+				}
+			}
+			if target != "" {
+				ev := session.NewEvent(invCtx.InvocationID())
+				ev.Author = invCtx.Agent().Name()
+				ev.Branch = invCtx.Branch()
+				ev.Actions.TransferToAgent = target
+				sendEvent(ctx, eventCh, eventOrError{event: ev})
+				return
+			}
+		}
 	}
 
 	if err := conn.Send(ctx, &model.LiveRequest{ToolResponse: responses}); err != nil {

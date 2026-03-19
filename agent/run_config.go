@@ -48,6 +48,9 @@ type RunConfig struct {
 	OutputAudioTranscription bool
 	ToolCoalesceWindow       time.Duration // default 150ms if zero
 	LiveBufferSize           int           // default 100 if zero
+	// TransferAgentDelay is the time to wait after a transfer_to_agent tool
+	// response before switching to the target agent in live mode. Default 1s if zero.
+	TransferAgentDelay time.Duration
 	// Generation parameters — applied to the live session config when set.
 	ThinkingConfig  *genai.ThinkingConfig
 	Temperature     *float32
