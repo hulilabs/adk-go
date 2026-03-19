@@ -48,6 +48,9 @@ type RunConfig struct {
 	OutputAudioTranscription bool
 	ToolCoalesceWindow       time.Duration // default 150ms if zero
 	LiveBufferSize           int           // default 100 if zero
+	// EnableAffectiveDialog enables emotion detection and adaptive responses
+	// in live sessions.
+	EnableAffectiveDialog *bool
 	// Generation parameters — applied to the live session config when set.
 	ThinkingConfig  *genai.ThinkingConfig
 	Temperature     *float32

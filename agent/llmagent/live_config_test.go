@@ -40,6 +40,21 @@ func TestLiveConfigFromRunConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("enable_affective_dialog_mapped", func(t *testing.T) {
+		enabled := true
+		rc := &agent.RunConfig{
+			EnableAffectiveDialog: &enabled,
+		}
+
+		got := liveConfigFromRunConfig(rc)
+		want := &genai.LiveConnectConfig{
+			EnableAffectiveDialog: &enabled,
+		}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Errorf("mismatch (-want +got):\n%s", diff)
+		}
+	})
+
 	t.Run("all_generation_params_mapped", func(t *testing.T) {
 		temp := float32(0.7)
 		topP := float32(0.9)
