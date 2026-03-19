@@ -197,7 +197,9 @@ func (t *mockTool) Calls() []mockToolCall {
 // ---------------------------------------------------------------------------
 
 type mockLiveLLM struct {
-	conn model.LiveConnection
+	conn        model.LiveConnection
+	mu          sync.Mutex
+	lastRequest *model.LLMRequest
 }
 
 func (m *mockLiveLLM) Name() string { return "mock-live" }
@@ -206,8 +208,17 @@ func (m *mockLiveLLM) GenerateContent(_ context.Context, _ *model.LLMRequest, _ 
 	return func(yield func(*model.LLMResponse, error) bool) {}
 }
 
-func (m *mockLiveLLM) ConnectLive(_ context.Context, _ *model.LLMRequest) (model.LiveConnection, error) {
+func (m *mockLiveLLM) ConnectLive(_ context.Context, req *model.LLMRequest) (model.LiveConnection, error) {
+	m.mu.Lock()
+	m.lastRequest = req
+	m.mu.Unlock()
 	return m.conn, nil
+}
+
+func (m *mockLiveLLM) LastRequest() *model.LLMRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastRequest
 }
 
 var _ model.LiveCapableLLM = (*mockLiveLLM)(nil)
@@ -1219,63 +1230,100 @@ func TestScenario15_DeferFlushOnConsumerBreak(t *testing.T) {
 // Scenario 16: Auto-enable transcription for multi-agent live sessions
 // ---------------------------------------------------------------------------
 
-func TestScenario16_AutoEnableTranscriptionMultiAgent(t *testing.T) {
-	conn := newMockLiveConnection()
-	conn.recvResponses = []*model.LLMResponse{
-		turnCompleteResponse(),
-	}
-
-	llm := &mockLiveLLM{conn: conn}
-
+func setupMultiAgentRunner(t *testing.T, llm *mockLiveLLM) *Runner {
+	t.Helper()
 	subAgent, _ := llmagent.New(llmagent.Config{
 		Name:  "sub_agent",
 		Model: llm,
 	})
-
 	rootAgent, _ := llmagent.New(llmagent.Config{
 		Name:      "root_agent",
 		Model:     llm,
 		SubAgents: []agent.Agent{subAgent},
 	})
-
 	svc := &mockSessionService{Service: session.InMemoryService()}
 	_, _ = svc.Service.Create(context.Background(), &session.CreateRequest{
 		AppName: "test", UserID: "user1", SessionID: "sess1",
 	})
-
 	r, _ := New(Config{
 		AppName:        "test",
 		Agent:          rootAgent,
 		SessionService: svc,
 	})
+	return r
+}
 
-	queue := agent.NewLiveRequestQueue(100)
-	queue.Close()
-
+func TestScenario16_AutoEnableTranscriptionMultiAgent(t *testing.T) {
 	t.Run("input_transcription_auto_enabled", func(t *testing.T) {
+		conn := newMockLiveConnection()
+		conn.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+		llm := &mockLiveLLM{conn: conn}
+		r := setupMultiAgentRunner(t, llm)
+		queue := agent.NewLiveRequestQueue(100)
+		queue.Close()
+
 		cfg := agent.RunConfig{}
 		for range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
 		}
-		// RunLive should have auto-enabled InputAudioTranscription.
-		// We verify indirectly: since RunLive mutates the cfg copy, we check
-		// that the live connect config sent to the model has transcription enabled.
-		// The mock doesn't expose this directly, so we just verify the build passes
-		// and the logic is exercised without errors.
+
+		req := llm.LastRequest()
+		if req == nil || req.LiveConfig == nil {
+			t.Fatal("expected ConnectLive to be called with a LiveConfig")
+		}
+		if req.LiveConfig.InputAudioTranscription == nil {
+			t.Error("expected InputAudioTranscription to be auto-enabled for multi-agent")
+		}
 	})
 
 	t.Run("output_transcription_auto_enabled_with_audio", func(t *testing.T) {
+		conn := newMockLiveConnection()
+		conn.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+		llm := &mockLiveLLM{conn: conn}
+		r := setupMultiAgentRunner(t, llm)
+		queue := agent.NewLiveRequestQueue(100)
+		queue.Close()
+
 		cfg := agent.RunConfig{
 			ResponseModalities: []genai.Modality{genai.ModalityAudio},
 		}
 		for range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
 		}
+
+		req := llm.LastRequest()
+		if req == nil || req.LiveConfig == nil {
+			t.Fatal("expected ConnectLive to be called with a LiveConfig")
+		}
+		if req.LiveConfig.InputAudioTranscription == nil {
+			t.Error("expected InputAudioTranscription to be auto-enabled for multi-agent")
+		}
+		if req.LiveConfig.OutputAudioTranscription == nil {
+			t.Error("expected OutputAudioTranscription to be auto-enabled for multi-agent with audio modality")
+		}
 	})
 
 	t.Run("output_transcription_not_enabled_without_audio", func(t *testing.T) {
+		conn := newMockLiveConnection()
+		conn.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+		llm := &mockLiveLLM{conn: conn}
+		r := setupMultiAgentRunner(t, llm)
+		queue := agent.NewLiveRequestQueue(100)
+		queue.Close()
+
 		cfg := agent.RunConfig{
 			ResponseModalities: []genai.Modality{genai.ModalityText},
 		}
 		for range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+		}
+
+		req := llm.LastRequest()
+		if req == nil || req.LiveConfig == nil {
+			t.Fatal("expected ConnectLive to be called with a LiveConfig")
+		}
+		if req.LiveConfig.InputAudioTranscription == nil {
+			t.Error("expected InputAudioTranscription to be auto-enabled for multi-agent")
+		}
+		if req.LiveConfig.OutputAudioTranscription != nil {
+			t.Error("expected OutputAudioTranscription to NOT be auto-enabled without audio modality")
 		}
 	})
 }
