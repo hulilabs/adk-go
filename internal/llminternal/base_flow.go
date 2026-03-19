@@ -176,6 +176,24 @@ func (f *Flow) runCFC(ctx agent.InvocationContext) iter.Seq2[*session.Event, err
 			liveCfg.Tools = []*genai.Tool{{FunctionDeclarations: decls}}
 		}
 
+		// Execute BeforeModelCallbacks before starting the live flow.
+		// AfterModelCallbacks are not supported in CFC mode because the
+		// live flow yields a stream of events rather than a single response.
+		for _, callback := range f.BeforeModelCallbacks {
+			cctx := icontext.NewCallbackContextWithDelta(ctx, nil, nil)
+			cbResp, cbErr := callback(cctx, req)
+			if cbResp != nil || cbErr != nil {
+				ev := session.NewEvent(ctx.InvocationID())
+				ev.Author = ctx.Agent().Name()
+				ev.Branch = ctx.Branch()
+				if cbResp != nil {
+					ev.LLMResponse = *cbResp
+				}
+				yield(ev, cbErr)
+				return
+			}
+		}
+
 		req.LiveConfig = liveCfg
 		conn, err := liveLLM.ConnectLive(ctx, req)
 		if err != nil {
@@ -183,10 +201,16 @@ func (f *Flow) runCFC(ctx agent.InvocationContext) iter.Seq2[*session.Event, err
 			return
 		}
 
-		// Create a temporary queue, seed it with the user content, and close
-		// it so the live flow processes exactly one turn.
+		// Create a temporary queue, seed it with the preprocessed contents,
+		// and close it so the live flow processes exactly one turn.
+		// Fall back to UserContent if preprocessing didn't populate Contents
+		// (e.g. session has no prior events yet).
 		queue := agent.NewLiveRequestQueue(16)
-		if ctx.UserContent() != nil {
+		if len(req.Contents) > 0 {
+			for _, content := range req.Contents {
+				_ = queue.Send(context.Background(), &model.LiveRequest{Content: content})
+			}
+		} else if ctx.UserContent() != nil {
 			_ = queue.Send(context.Background(), &model.LiveRequest{Content: ctx.UserContent()})
 		}
 		queue.Close()

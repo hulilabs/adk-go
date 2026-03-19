@@ -15,12 +15,18 @@
 package llminternal
 
 import (
+	"context"
 	"errors"
+	"io"
+	"iter"
+	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/genai"
 
+	"google.golang.org/adk/agent"
+	"google.golang.org/adk/internal/agent/runconfig"
 	icontext "google.golang.org/adk/internal/context"
 	"google.golang.org/adk/internal/toolinternal"
 	"google.golang.org/adk/model"
@@ -573,5 +579,206 @@ func TestMergeEventActions(t *testing.T) {
 				t.Errorf("mergeEventActions() mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CFC (Compositional Function Calling) tests
+// ---------------------------------------------------------------------------
+
+// cfcMockLLM is a basic LLM that does NOT implement LiveCapableLLM.
+type cfcMockLLM struct {
+	name string
+}
+
+func (m *cfcMockLLM) Name() string { return m.name }
+
+func (m *cfcMockLLM) GenerateContent(_ context.Context, _ *model.LLMRequest, _ bool) iter.Seq2[*model.LLMResponse, error] {
+	return func(yield func(*model.LLMResponse, error) bool) {}
+}
+
+// cfcMockLiveLLM implements LiveCapableLLM.
+type cfcMockLiveLLM struct {
+	name    string
+	conn    *cfcMockLiveConn
+	mu      sync.Mutex
+	lastReq *model.LLMRequest
+}
+
+func (m *cfcMockLiveLLM) Name() string { return m.name }
+
+func (m *cfcMockLiveLLM) GenerateContent(_ context.Context, _ *model.LLMRequest, _ bool) iter.Seq2[*model.LLMResponse, error] {
+	return func(yield func(*model.LLMResponse, error) bool) {}
+}
+
+func (m *cfcMockLiveLLM) ConnectLive(_ context.Context, req *model.LLMRequest) (model.LiveConnection, error) {
+	m.mu.Lock()
+	m.lastReq = req
+	m.mu.Unlock()
+	return m.conn, nil
+}
+
+var _ model.LiveCapableLLM = (*cfcMockLiveLLM)(nil)
+
+// cfcMockLiveConn records sent messages and returns a turn-complete then EOF.
+type cfcMockLiveConn struct {
+	mu      sync.Mutex
+	sent    []*model.LiveRequest
+	recvIdx int
+}
+
+func (c *cfcMockLiveConn) Send(_ context.Context, req *model.LiveRequest) error {
+	c.mu.Lock()
+	c.sent = append(c.sent, req)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *cfcMockLiveConn) Receive(_ context.Context) (*model.LLMResponse, error) {
+	c.mu.Lock()
+	idx := c.recvIdx
+	c.recvIdx++
+	c.mu.Unlock()
+	if idx == 0 {
+		return &model.LLMResponse{TurnComplete: true}, nil
+	}
+	return nil, io.EOF
+}
+
+func (c *cfcMockLiveConn) Close() error { return nil }
+
+func (c *cfcMockLiveConn) Sent() []*model.LiveRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cp := make([]*model.LiveRequest, len(c.sent))
+	copy(cp, c.sent)
+	return cp
+}
+
+// cfcMockAgent satisfies agent.Agent for CFC tests by embedding the interface.
+type cfcMockAgent struct {
+	agent.Agent
+	name string
+}
+
+func (a *cfcMockAgent) Name() string { return a.name }
+
+func TestRunCFC_ErrorNonGemini2Model(t *testing.T) {
+	f := &Flow{
+		Model:             &cfcMockLLM{name: "gpt-4"},
+		RequestProcessors: DefaultRequestProcessors,
+	}
+	ctx := runconfig.ToContext(context.Background(), &runconfig.RunConfig{})
+	invCtx := icontext.NewInvocationContext(ctx, icontext.InvocationContextParams{
+		Agent:     &cfcMockAgent{name: "test"},
+		RunConfig: &agent.RunConfig{SupportCFC: true},
+	})
+
+	var errs []error
+	for _, err := range f.Run(invCtx) {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) == 0 {
+		t.Fatal("expected error for non-gemini-2 model")
+	}
+	if errs[0].Error() != "compositional function calling (CFC) is only supported for gemini-2 models" {
+		t.Errorf("unexpected error: %v", errs[0])
+	}
+}
+
+func TestRunCFC_ErrorNotLiveCapable(t *testing.T) {
+	f := &Flow{
+		Model:             &cfcMockLLM{name: "gemini-2-flash"},
+		RequestProcessors: DefaultRequestProcessors,
+	}
+	ctx := runconfig.ToContext(context.Background(), &runconfig.RunConfig{})
+	invCtx := icontext.NewInvocationContext(ctx, icontext.InvocationContextParams{
+		Agent:     &cfcMockAgent{name: "test"},
+		RunConfig: &agent.RunConfig{SupportCFC: true},
+	})
+
+	var errs []error
+	for _, err := range f.Run(invCtx) {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) == 0 {
+		t.Fatal("expected error for non-LiveCapable model")
+	}
+	want := `model "gemini-2-flash" does not support live connections required for CFC`
+	if errs[0].Error() != want {
+		t.Errorf("unexpected error: %v", errs[0])
+	}
+}
+
+func TestRunCFC_SuccessfulRedirect(t *testing.T) {
+	conn := &cfcMockLiveConn{}
+	llm := &cfcMockLiveLLM{name: "gemini-2.0-flash", conn: conn}
+	// Use a minimal ContentsRequestProcessor so req.Contents gets populated
+	// from session events, bypassing processors that require a real LLMAgent.
+	f := &Flow{
+		Model:             llm,
+		RequestProcessors: []func(agent.InvocationContext, *model.LLMRequest, *Flow) iter.Seq2[*session.Event, error]{ContentsRequestProcessor},
+	}
+	svc := session.InMemoryService()
+	resp, err := svc.Create(context.Background(), &session.CreateRequest{
+		AppName: "test", UserID: "user1", SessionID: "sess1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := runconfig.ToContext(context.Background(), &runconfig.RunConfig{})
+	invCtx := icontext.NewInvocationContext(ctx, icontext.InvocationContextParams{
+		Agent:       &cfcMockAgent{name: "test"},
+		RunConfig:   &agent.RunConfig{SupportCFC: true},
+		UserContent: genai.NewContentFromText("Hello", "user"),
+		Session:     resp.Session,
+	})
+
+	var events []*session.Event
+	var errs []error
+	for ev, err := range f.Run(invCtx) {
+		if err != nil {
+			errs = append(errs, err)
+		}
+		if ev != nil {
+			events = append(events, ev)
+		}
+	}
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	// LiveFlow should have produced at least a turn-complete event.
+	if len(events) == 0 {
+		t.Fatal("expected at least one event from CFC live flow")
+	}
+
+	// Verify ConnectLive was called with a LiveConfig.
+	llm.mu.Lock()
+	req := llm.lastReq
+	llm.mu.Unlock()
+	if req == nil || req.LiveConfig == nil {
+		t.Fatal("expected ConnectLive to be called with LiveConfig")
+	}
+	if len(req.LiveConfig.ResponseModalities) == 0 || req.LiveConfig.ResponseModalities[0] != genai.ModalityText {
+		t.Error("expected text-only response modalities in CFC mode")
+	}
+
+	// Verify preprocessed contents were sent to the live connection
+	// (not raw UserContent).
+	sent := conn.Sent()
+	foundContent := false
+	for _, s := range sent {
+		if s.Content != nil {
+			foundContent = true
+		}
+	}
+	if !foundContent {
+		t.Error("expected preprocessed contents to be sent to the live connection")
 	}
 }
