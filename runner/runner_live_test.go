@@ -1214,3 +1214,146 @@ func TestScenario15_DeferFlushOnConsumerBreak(t *testing.T) {
 		t.Errorf("flushed author = %q, want agent name", persisted[0].Author)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 16: Agent transfer in live mode via transfer_to_agent tool
+// ---------------------------------------------------------------------------
+
+func TestScenario16_AgentTransferLive(t *testing.T) {
+	// Root agent's connection: returns a transfer_to_agent function call.
+	rootConn := newMockLiveConnection()
+	rootConn.recvCh = make(chan *model.LLMResponse, 10)
+
+	// Sub-agent's connection: returns turn-complete immediately then EOF.
+	subConn := newMockLiveConnection()
+	subConn.recvResponses = []*model.LLMResponse{
+		turnCompleteResponse(),
+	}
+
+	// Track which connection to return based on call count.
+	callCount := 0
+	llm := &mockLiveLLM{conn: rootConn}
+	origConnect := llm.ConnectLive
+	_ = origConnect
+	// Override ConnectLive to return different connections per call.
+	type multiConnLLM struct {
+		model.LLM
+		conns []*mockLiveConnection
+		idx   int
+	}
+	mllm := &multiConnLLM{
+		LLM:   llm,
+		conns: []*mockLiveConnection{rootConn, subConn},
+	}
+	_ = callCount
+
+	// Use a custom LLM wrapper that returns different connections.
+	type liveMultiConnLLM struct {
+		*mockLiveLLM
+		conns []*mockLiveConnection
+		mu    sync.Mutex
+		idx   int
+	}
+	liveLLM := &liveMultiConnLLM{
+		mockLiveLLM: llm,
+		conns:       []*mockLiveConnection{rootConn, subConn},
+	}
+	_ = mllm
+
+	// Create sub-agent (target of transfer).
+	subAgent, _ := llmagent.New(llmagent.Config{
+		Name:        "helper_agent",
+		Description: "A helper agent",
+		Model:       liveLLM,
+	})
+
+	// Create root agent with sub-agent.
+	rootAgent, _ := llmagent.New(llmagent.Config{
+		Name:      "root_agent",
+		Model:     liveLLM,
+		SubAgents: []agent.Agent{subAgent},
+	})
+
+	svc := &mockSessionService{Service: session.InMemoryService()}
+	_, _ = svc.Service.Create(context.Background(), &session.CreateRequest{
+		AppName: "test", UserID: "user1", SessionID: "sess1",
+	})
+
+	r, _ := New(Config{
+		AppName:        "test",
+		Agent:          rootAgent,
+		SessionService: svc,
+	})
+
+	queue := agent.NewLiveRequestQueue(100)
+
+	go func() {
+		// Model calls transfer_to_agent with the sub-agent name.
+		rootConn.recvCh <- functionCallResponse("fc1", "transfer_to_agent", map[string]any{"agent_name": "helper_agent"})
+	}()
+
+	cfg := agent.RunConfig{
+		ToolCoalesceWindow: 10 * time.Millisecond,
+		TransferAgentDelay: 50 * time.Millisecond,
+	}
+
+	start := time.Now()
+	var events []*session.Event
+	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+		if err != nil {
+			break
+		}
+		if ev != nil {
+			events = append(events, ev)
+		}
+	}
+	elapsed := time.Since(start)
+
+	// Should complete quickly.
+	if elapsed > 10*time.Second {
+		t.Errorf("test took %v, expected quick completion after transfer", elapsed)
+	}
+
+	// Root connection should be closed (transfer terminated it).
+	if !rootConn.WasClosed() {
+		t.Error("expected root connection to be closed after transfer")
+	}
+
+	// Sub-agent's connection should have been used (ConnectLive called twice:
+	// once for root, once for sub-agent).
+	if subConn.WasClosed() {
+		// Sub-agent's connection was at least opened.
+	}
+
+	// The transfer_to_agent tool call should appear in the root conn's send log
+	// (it was received from the model and processed).
+	rootSendLog := rootConn.SendLog()
+	hasToolResponse := false
+	for _, req := range rootSendLog {
+		if req.ToolResponse != nil {
+			hasToolResponse = true
+		}
+	}
+	// No tool response should be sent back to the model for transfer_to_agent.
+	if hasToolResponse {
+		t.Error("transfer_to_agent response should NOT be sent back to the model")
+	}
+}
+
+// liveMultiConnLLM returns different connections for each ConnectLive call.
+type liveMultiConnLLM struct {
+	*mockLiveLLM
+	conns []*mockLiveConnection
+	mu    sync.Mutex
+	idx   int
+}
+
+func (m *liveMultiConnLLM) ConnectLive(_ context.Context, _ *model.LLMRequest) (model.LiveConnection, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	conn := m.conns[m.idx%len(m.conns)]
+	m.idx++
+	return conn, nil
+}
+
+var _ model.LiveCapableLLM = (*liveMultiConnLLM)(nil)

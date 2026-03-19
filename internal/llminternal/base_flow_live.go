@@ -150,7 +150,14 @@ func (lf *LiveFlow) RunLive(
 			if rc := ctx.RunConfig(); rc != nil && rc.TransferAgentDelay > 0 {
 				delay = rc.TransferAgentDelay
 			}
-			time.Sleep(delay)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+			}
+
+			// Close the current queue so the sub-agent's live session
+			// can start fresh with its own sender/receiver loops.
+			queue.Close()
 
 			nextAgent := agentToRunLive(ctx, transferTarget)
 			if nextAgent == nil {
@@ -496,34 +503,21 @@ func (lf *LiveFlow) flushToolCalls(
 
 	groups := deduplicateCalls(calls)
 	lf.emitFunctionCallEvent(ctx, invCtx, calls, eventCh)
-	responses := lf.executeToolGroups(ctx, invCtx, cs, groups, toolsFuncMap)
+	responses, transferTarget := lf.executeToolGroups(ctx, invCtx, cs, groups, toolsFuncMap)
 
 	if len(responses) == 0 {
 		return
 	}
 
-	// Check for transfer_to_agent: intercept the transfer response and emit
-	// a transfer event instead of sending it back to the model.
-	for _, r := range responses {
-		if r.Name == "transfer_to_agent" {
-			target, _ := r.Response["agent_name"].(string)
-			if target == "" {
-				// Fall back: check if the tool set TransferToAgent on the response map.
-				// The TransferToAgentTool.Run sets ctx.Actions().TransferToAgent,
-				// but we can also check the response directly.
-				if t, ok := r.Response["transfer_to_agent"].(string); ok {
-					target = t
-				}
-			}
-			if target != "" {
-				ev := session.NewEvent(invCtx.InvocationID())
-				ev.Author = invCtx.Agent().Name()
-				ev.Branch = invCtx.Branch()
-				ev.Actions.TransferToAgent = target
-				sendEvent(ctx, eventCh, eventOrError{event: ev})
-				return
-			}
-		}
+	// If a tool signalled a transfer (via ctx.Actions().TransferToAgent),
+	// emit a transfer event instead of sending the response to the model.
+	if transferTarget != "" {
+		ev := session.NewEvent(invCtx.InvocationID())
+		ev.Author = invCtx.Agent().Name()
+		ev.Branch = invCtx.Branch()
+		ev.Actions.TransferToAgent = transferTarget
+		sendEvent(ctx, eventCh, eventOrError{event: ev})
+		return
 	}
 
 	if err := conn.Send(ctx, &model.LiveRequest{ToolResponse: responses}); err != nil {
@@ -595,8 +589,9 @@ func (lf *LiveFlow) executeToolGroups(
 	cs *coalesceState,
 	groups map[string]*callGroup,
 	toolsFuncMap map[string]toolinternal.FunctionTool,
-) []*genai.FunctionResponse {
+) ([]*genai.FunctionResponse, string) {
 	var responses []*genai.FunctionResponse
+	var transferTarget string
 	for _, g := range groups {
 		fc := g.fc
 		primaryID := g.ids[0]
@@ -606,7 +601,7 @@ func (lf *LiveFlow) executeToolGroups(
 		cs.inFlightCancel[primaryID] = toolCancel
 		cs.mu.Unlock()
 
-		result := lf.callToolLive(toolCtx, invCtx, fc, toolsFuncMap)
+		result, target := lf.callToolLive(toolCtx, invCtx, fc, toolsFuncMap)
 
 		// Check for external cancellation BEFORE calling toolCancel(),
 		// otherwise toolCtx.Err() is always non-nil after our own cleanup cancel.
@@ -620,13 +615,17 @@ func (lf *LiveFlow) executeToolGroups(
 			continue
 		}
 
+		if target != "" {
+			transferTarget = target
+		}
+
 		for _, id := range g.ids {
 			responses = append(responses, &genai.FunctionResponse{
 				ID: id, Name: fc.Name, Response: result,
 			})
 		}
 	}
-	return responses
+	return responses, transferTarget
 }
 
 func (lf *LiveFlow) emitFunctionResponseEvent(
@@ -648,25 +647,28 @@ func (lf *LiveFlow) emitFunctionResponseEvent(
 	sendEvent(ctx, eventCh, eventOrError{event: ev})
 }
 
+// callToolLive executes a tool and returns the response map plus any transfer
+// target set via ctx.Actions().TransferToAgent (used by TransferToAgentTool).
 func (lf *LiveFlow) callToolLive(
 	ctx context.Context,
 	invCtx agent.InvocationContext,
 	fc *genai.FunctionCall,
 	toolsFuncMap map[string]toolinternal.FunctionTool,
-) map[string]any {
+) (map[string]any, string) {
 	funcTool, ok := toolsFuncMap[fc.Name]
 	if !ok {
-		return map[string]any{"error": fmt.Sprintf("tool %q not found", fc.Name)}
+		return map[string]any{"error": fmt.Sprintf("tool %q not found", fc.Name)}, ""
 	}
 
-	toolCtx := toolinternal.NewToolContext(invCtx, fc.ID, &session.EventActions{StateDelta: make(map[string]any)}, nil)
+	actions := &session.EventActions{StateDelta: make(map[string]any)}
+	toolCtx := toolinternal.NewToolContext(invCtx, fc.ID, actions, nil)
 	wrappedCtx := &cancelableToolContext{Context: toolCtx, cancelCtx: ctx}
 
 	response, err := lf.runToolWithCallbacks(wrappedCtx, invCtx, funcTool, fc.Args)
 	if err != nil {
-		return map[string]any{"error": err.Error()}
+		return map[string]any{"error": err.Error()}, ""
 	}
-	return response
+	return response, actions.TransferToAgent
 }
 
 func (lf *LiveFlow) runToolWithCallbacks(
