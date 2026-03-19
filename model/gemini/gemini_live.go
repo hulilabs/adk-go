@@ -138,6 +138,11 @@ func mapServerMessage(msg *genai.LiveServerMessage) *model.LLMResponse {
 
 	if msg.GoAway != nil {
 		resp.CustomMetadata["go_away"] = true
+		resp.GoAway = msg.GoAway
+	}
+
+	if msg.SessionResumptionUpdate != nil {
+		resp.SessionResumptionUpdate = msg.SessionResumptionUpdate
 	}
 
 	if msg.UsageMetadata != nil {

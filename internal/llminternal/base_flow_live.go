@@ -73,16 +73,21 @@ func sendEvent(ctx context.Context, eventCh chan<- eventOrError, msg eventOrErro
 	}
 }
 
+// ConnectFn creates a new live connection, optionally resuming a previous
+// session via the provided handle (empty string = new session).
+type ConnectFn func(handle string) (model.LiveConnection, error)
+
+const maxReconnectRetries = 3
+
 // RunLive runs the live flow, returning an iterator of events.
+// It accepts a ConnectFn instead of a raw connection so it can reconnect
+// on GoAway signals using session resumption handles.
 func (lf *LiveFlow) RunLive(
 	ctx agent.InvocationContext,
-	conn model.LiveConnection,
+	connectFn ConnectFn,
 	queue *agent.LiveRequestQueue,
 ) iter.Seq2[*session.Event, error] {
 	return func(yield func(*session.Event, error) bool) {
-		cancelCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
 		toolsFuncMap := make(map[string]toolinternal.FunctionTool)
 		for _, t := range lf.Tools {
 			if ft, ok := t.(toolinternal.FunctionTool); ok {
@@ -90,53 +95,85 @@ func (lf *LiveFlow) RunLive(
 			}
 		}
 
-		if err := lf.sendHistory(cancelCtx, ctx, conn); err != nil {
-			yield(nil, fmt.Errorf("history handoff failed: %w", err))
-			return
-		}
-
-		eventCh := make(chan eventOrError, 64)
-		var wg sync.WaitGroup
-		cs := &coalesceState{
-			buffer:         make(map[string]*genai.FunctionCall),
-			dedup:          make(map[string]string),
-			inFlightCancel: make(map[string]context.CancelFunc),
-			flushCh:        make(chan struct{}, 1),
-		}
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			lf.senderLoop(cancelCtx, conn, queue, eventCh)
-			// Close connection when sender is done (queue closed or error).
-			// This unblocks the receiver's conn.Receive without cancelling
-			// the context used by in-flight tool calls.
-			_ = conn.Close()
-		}()
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			lf.receiverLoop(cancelCtx, ctx, conn, queue, cs, toolsFuncMap, eventCh, &wg)
-		}()
-
-		// Closer goroutine: eventCh is closed only after ALL producers
-		// (sender, receiver, receive worker) have exited. This is the
-		// single owner of the close operation, eliminating races.
-		go func() {
-			wg.Wait()
-			close(eventCh)
-		}()
-
-		for msg := range eventCh {
-			if !yield(msg.event, msg.err) {
-				break
+		for attempt := 0; attempt <= maxReconnectRetries; attempt++ {
+			conn, err := connectFn(ctx.LiveSessionResumptionHandle())
+			if err != nil {
+				if attempt < maxReconnectRetries {
+					time.Sleep(time.Duration(attempt+1) * time.Second)
+					continue
+				}
+				yield(nil, fmt.Errorf("failed to connect live after %d retries: %w", maxReconnectRetries, err))
+				return
 			}
-		}
 
-		cancel()
-		_ = conn.Close()
-		wg.Wait()
+			cancelCtx, cancel := context.WithCancel(ctx)
+
+			if err := lf.sendHistory(cancelCtx, ctx, conn); err != nil {
+				cancel()
+				_ = conn.Close()
+				yield(nil, fmt.Errorf("history handoff failed: %w", err))
+				return
+			}
+
+			eventCh := make(chan eventOrError, 64)
+			var wg sync.WaitGroup
+			cs := &coalesceState{
+				buffer:         make(map[string]*genai.FunctionCall),
+				dedup:          make(map[string]string),
+				inFlightCancel: make(map[string]context.CancelFunc),
+				flushCh:        make(chan struct{}, 1),
+			}
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				lf.senderLoop(cancelCtx, conn, queue, eventCh)
+				_ = conn.Close()
+			}()
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				lf.receiverLoop(cancelCtx, ctx, conn, queue, cs, toolsFuncMap, eventCh, &wg)
+			}()
+
+			go func() {
+				wg.Wait()
+				close(eventCh)
+			}()
+
+			shouldReconnect := false
+			for msg := range eventCh {
+				// Handle session resumption updates.
+				if msg.event != nil && msg.event.SessionResumptionUpdate != nil {
+					upd := msg.event.SessionResumptionUpdate
+					if upd.Resumable && upd.NewHandle != "" {
+						ctx.SetLiveSessionResumptionHandle(upd.NewHandle)
+					}
+				}
+				// Handle GoAway: trigger reconnection.
+				if msg.event != nil && msg.event.GoAway != nil {
+					shouldReconnect = true
+					break
+				}
+				if !yield(msg.event, msg.err) {
+					cancel()
+					_ = conn.Close()
+					wg.Wait()
+					return
+				}
+			}
+
+			cancel()
+			_ = conn.Close()
+			wg.Wait()
+
+			if !shouldReconnect {
+				return
+			}
+			// Brief backoff before reconnecting.
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 }
 

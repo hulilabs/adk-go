@@ -434,12 +434,13 @@ type invocationContext struct {
 	memory    Memory
 	session   session.Session
 
-	invocationID     string
-	branch           string
-	userContent      *genai.Content
-	runConfig        *RunConfig
-	endInvocation    bool
-	liveRequestQueue *LiveRequestQueue
+	invocationID                string
+	branch                      string
+	userContent                 *genai.Content
+	runConfig                   *RunConfig
+	endInvocation               bool
+	liveRequestQueue            *LiveRequestQueue
+	liveSessionResumptionHandle string
 }
 
 func (c *invocationContext) Agent() Agent {
@@ -476,6 +477,14 @@ func (c *invocationContext) RunConfig() *RunConfig {
 
 func (c *invocationContext) LiveRequestQueue() *LiveRequestQueue {
 	return c.liveRequestQueue
+}
+
+func (c *invocationContext) SetLiveSessionResumptionHandle(handle string) {
+	c.liveSessionResumptionHandle = handle
+}
+
+func (c *invocationContext) LiveSessionResumptionHandle() string {
+	return c.liveSessionResumptionHandle
 }
 
 func (c *invocationContext) EndInvocation() {

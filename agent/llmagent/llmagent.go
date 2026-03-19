@@ -452,9 +452,17 @@ func (a *llmAgent) runLive(ctx agent.InvocationContext) iter.Seq2[*session.Event
 	}
 	req.LiveConfig.Tools = buildLiveTools(a.Tools)
 
-	conn, err := liveLLM.ConnectLive(ctx, req)
-	if err != nil {
-		return llminternal.ErrIter(fmt.Errorf("failed to connect live: %w", err))
+	connectFn := func(handle string) (model.LiveConnection, error) {
+		cfgCopy := *req.LiveConfig
+		if handle != "" {
+			if cfgCopy.SessionResumption == nil {
+				cfgCopy.SessionResumption = &genai.SessionResumptionConfig{}
+			}
+			cfgCopy.SessionResumption.Handle = handle
+		}
+		reqCopy := *req
+		reqCopy.LiveConfig = &cfgCopy
+		return liveLLM.ConnectLive(ctx, &reqCopy)
 	}
 
 	coalesceWindow := time.Duration(0)
@@ -474,7 +482,7 @@ func (a *llmAgent) runLive(ctx agent.InvocationContext) iter.Seq2[*session.Event
 		CoalesceWindow:       coalesceWindow,
 	}
 
-	return lf.RunLive(ctx, conn, queue)
+	return lf.RunLive(ctx, connectFn, queue)
 }
 
 func liveConfigFromRunConfig(rc *agent.RunConfig) *genai.LiveConnectConfig {
@@ -493,6 +501,9 @@ func liveConfigFromRunConfig(rc *agent.RunConfig) *genai.LiveConnectConfig {
 	}
 	if rc.OutputAudioTranscription {
 		cfg.OutputAudioTranscription = &genai.AudioTranscriptionConfig{}
+	}
+	if rc.SessionResumption != nil {
+		cfg.SessionResumption = rc.SessionResumption
 	}
 	if rc.ThinkingConfig != nil {
 		cfg.ThinkingConfig = rc.ThinkingConfig
