@@ -1214,3 +1214,139 @@ func TestScenario15_DeferFlushOnConsumerBreak(t *testing.T) {
 		t.Errorf("flushed author = %q, want agent name", persisted[0].Author)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 16: task_completed tool triggers clean shutdown
+// ---------------------------------------------------------------------------
+
+func TestScenario16_TaskCompletedShutdown(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvCh = make(chan *model.LLMResponse, 10)
+
+	taskTool := &mockTool{
+		name:   "task_completed",
+		result: map[string]any{"status": "done"},
+	}
+
+	llm := &mockLiveLLM{conn: conn}
+	a, _ := llmagent.New(llmagent.Config{
+		Name:  "test_agent",
+		Model: llm,
+		Tools: []tool.Tool{taskTool},
+	})
+
+	svc := &mockSessionService{Service: session.InMemoryService()}
+	_, _ = svc.Service.Create(context.Background(), &session.CreateRequest{
+		AppName: "test", UserID: "user1", SessionID: "sess1",
+	})
+
+	r, _ := New(Config{
+		AppName:        "test",
+		Agent:          a,
+		SessionService: svc,
+	})
+
+	queue := agent.NewLiveRequestQueue(100)
+
+	go func() {
+		// Send a function call for task_completed.
+		conn.recvCh <- functionCallResponse("fc1", "task_completed", nil)
+		// Don't close queue — the task_completed handler should do it.
+	}()
+
+	start := time.Now()
+	cfg := agent.RunConfig{
+		ToolCoalesceWindow:  10 * time.Millisecond,
+		TaskCompletionDelay: 100 * time.Millisecond,
+	}
+	var events []*session.Event
+	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+		if err != nil {
+			break
+		}
+		if ev != nil {
+			events = append(events, ev)
+		}
+	}
+	elapsed := time.Since(start)
+
+	// Should have completed (queue closed by task_completed handler).
+	if elapsed > 5*time.Second {
+		t.Errorf("test took %v, expected quick shutdown after task_completed", elapsed)
+	}
+
+	// The task_completed tool should have been called.
+	if taskTool.CallCount() != 1 {
+		t.Errorf("expected task_completed called once, got %d", taskTool.CallCount())
+	}
+
+	// Queue should be closed.
+	select {
+	case <-queue.Done():
+		// ok — queue was closed by the handler.
+	default:
+		t.Error("expected queue to be closed after task_completed")
+	}
+
+	// Connection should be closed.
+	if !conn.WasClosed() {
+		t.Error("expected connection to be closed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 17: task_completed respects context cancellation during delay
+// ---------------------------------------------------------------------------
+
+func TestScenario17_TaskCompletedCancellation(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvCh = make(chan *model.LLMResponse, 10)
+
+	taskTool := &mockTool{
+		name:   "task_completed",
+		result: map[string]any{"status": "done"},
+	}
+
+	llm := &mockLiveLLM{conn: conn}
+	a, _ := llmagent.New(llmagent.Config{
+		Name:  "test_agent",
+		Model: llm,
+		Tools: []tool.Tool{taskTool},
+	})
+
+	svc := &mockSessionService{Service: session.InMemoryService()}
+	_, _ = svc.Service.Create(context.Background(), &session.CreateRequest{
+		AppName: "test", UserID: "user1", SessionID: "sess1",
+	})
+
+	r, _ := New(Config{
+		AppName:        "test",
+		Agent:          a,
+		SessionService: svc,
+	})
+
+	queue := agent.NewLiveRequestQueue(100)
+	// Cancel the context quickly — should interrupt the delay.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	go func() {
+		conn.recvCh <- functionCallResponse("fc1", "task_completed", nil)
+	}()
+
+	start := time.Now()
+	cfg := agent.RunConfig{
+		ToolCoalesceWindow:  10 * time.Millisecond,
+		TaskCompletionDelay: 10 * time.Second, // Very long delay — should be cancelled.
+	}
+	for ev, err := range r.RunLive(ctx, "user1", "sess1", queue, cfg) {
+		_ = ev
+		_ = err
+	}
+	elapsed := time.Since(start)
+
+	// Should finish quickly due to context cancellation, not wait 10s.
+	if elapsed > 3*time.Second {
+		t.Errorf("test took %v, expected context cancellation to interrupt delay", elapsed)
+	}
+}

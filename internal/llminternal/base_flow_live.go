@@ -479,7 +479,10 @@ func (lf *LiveFlow) flushToolCalls(
 			if rc := invCtx.RunConfig(); rc != nil && rc.TaskCompletionDelay > 0 {
 				delay = rc.TaskCompletionDelay
 			}
-			time.Sleep(delay)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+			}
 			queue.Close()
 			return
 		}
