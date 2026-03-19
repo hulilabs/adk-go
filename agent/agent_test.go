@@ -274,7 +274,7 @@ func TestWithContext(t *testing.T) {
 	if got.Value(key) != val {
 		t.Errorf("WithContext() did not update context")
 	}
-	if diff := cmp.Diff(inv, got, cmp.AllowUnexported(invocationContext{}), cmpopts.IgnoreFields(invocationContext{}, "Context")); diff != "" {
+	if diff := cmp.Diff(inv, got, cmp.AllowUnexported(invocationContext{}), cmpopts.IgnoreFields(invocationContext{}, "Context", "streamingMu")); diff != "" {
 		t.Errorf("WithContext() params mismatch (-want +got):\n%s", diff)
 	}
 }

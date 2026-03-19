@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"sync"
 
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/genai"
@@ -440,6 +441,7 @@ type invocationContext struct {
 	runConfig            *RunConfig
 	endInvocation        bool
 	liveRequestQueue     *LiveRequestQueue
+	streamingMu          sync.Mutex
 	activeStreamingTools []*ActiveStreamingTool
 }
 
@@ -480,11 +482,17 @@ func (c *invocationContext) LiveRequestQueue() *LiveRequestQueue {
 }
 
 func (c *invocationContext) AddActiveStreamingTool(tool *ActiveStreamingTool) {
+	c.streamingMu.Lock()
 	c.activeStreamingTools = append(c.activeStreamingTools, tool)
+	c.streamingMu.Unlock()
 }
 
 func (c *invocationContext) ActiveStreamingTools() []*ActiveStreamingTool {
-	return c.activeStreamingTools
+	c.streamingMu.Lock()
+	cp := make([]*ActiveStreamingTool, len(c.activeStreamingTools))
+	copy(cp, c.activeStreamingTools)
+	c.streamingMu.Unlock()
+	return cp
 }
 
 func (c *invocationContext) EndInvocation() {
@@ -496,9 +504,21 @@ func (c *invocationContext) Ended() bool {
 }
 
 func (c *invocationContext) WithContext(ctx context.Context) InvocationContext {
-	newCtx := *c
-	newCtx.Context = ctx
-	return &newCtx
+	// Copy fields explicitly to avoid copying the sync.Mutex.
+	return &invocationContext{
+		Context:              ctx,
+		agent:                c.agent,
+		artifacts:            c.artifacts,
+		memory:               c.memory,
+		session:              c.session,
+		invocationID:         c.invocationID,
+		branch:               c.branch,
+		userContent:          c.userContent,
+		runConfig:            c.runConfig,
+		endInvocation:        c.endInvocation,
+		liveRequestQueue:     c.liveRequestQueue,
+		activeStreamingTools: c.activeStreamingTools,
+	}
 }
 
 func pluginManagerFromContext(ctx context.Context) pluginManager {

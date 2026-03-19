@@ -16,6 +16,7 @@ package context
 
 import (
 	"context"
+	"sync"
 
 	"github.com/google/uuid"
 	"google.golang.org/genai"
@@ -53,7 +54,8 @@ func NewInvocationContext(ctx context.Context, params InvocationContextParams) a
 type InvocationContext struct {
 	context.Context
 
-	params InvocationContextParams
+	params      InvocationContextParams
+	streamingMu sync.Mutex
 }
 
 func (c *InvocationContext) Artifacts() agent.Artifacts {
@@ -93,11 +95,17 @@ func (c *InvocationContext) LiveRequestQueue() *agent.LiveRequestQueue {
 }
 
 func (c *InvocationContext) AddActiveStreamingTool(tool *agent.ActiveStreamingTool) {
+	c.streamingMu.Lock()
 	c.params.ActiveStreamingTools = append(c.params.ActiveStreamingTools, tool)
+	c.streamingMu.Unlock()
 }
 
 func (c *InvocationContext) ActiveStreamingTools() []*agent.ActiveStreamingTool {
-	return c.params.ActiveStreamingTools
+	c.streamingMu.Lock()
+	cp := make([]*agent.ActiveStreamingTool, len(c.params.ActiveStreamingTools))
+	copy(cp, c.params.ActiveStreamingTools)
+	c.streamingMu.Unlock()
+	return cp
 }
 
 func (c *InvocationContext) EndInvocation() {
@@ -109,9 +117,10 @@ func (c *InvocationContext) Ended() bool {
 }
 
 func (c *InvocationContext) WithContext(ctx context.Context) agent.InvocationContext {
-	newCtx := *c
-	newCtx.Context = ctx
-	return &newCtx
+	return &InvocationContext{
+		Context: ctx,
+		params:  c.params,
+	}
 }
 
 var _ agent.InvocationContext = (*InvocationContext)(nil)

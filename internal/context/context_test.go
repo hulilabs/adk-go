@@ -60,7 +60,7 @@ func TestWithContext(t *testing.T) {
 	if got.Value(key) != val {
 		t.Errorf("WithContext() did not update context")
 	}
-	if diff := cmp.Diff(inv, got, cmp.AllowUnexported(InvocationContext{}), cmpopts.IgnoreFields(InvocationContext{}, "Context")); diff != "" {
+	if diff := cmp.Diff(inv, got, cmp.AllowUnexported(InvocationContext{}), cmpopts.IgnoreFields(InvocationContext{}, "Context", "streamingMu")); diff != "" {
 		t.Errorf("WithContext() mismatch (-want +got):\n%s", diff)
 	}
 }

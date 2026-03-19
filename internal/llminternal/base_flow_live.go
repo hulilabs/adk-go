@@ -188,10 +188,20 @@ func (lf *LiveFlow) senderLoop(
 	queue *agent.LiveRequestQueue,
 	eventCh chan<- eventOrError,
 ) {
+	// Ensure all active streaming tools are closed on every exit path.
+	defer func() {
+		for _, st := range invCtx.ActiveStreamingTools() {
+			st.Close()
+		}
+	}()
+
 	fanOut := func(req *model.LiveRequest) {
 		for _, st := range invCtx.ActiveStreamingTools() {
-			// Best-effort: skip if the tool's queue is closed or full.
-			_ = st.Stream.Send(ctx, req)
+			// Non-blocking: fire-and-forget goroutine so a full tool
+			// queue cannot stall the main sender loop.
+			go func(s *agent.ActiveStreamingTool, r *model.LiveRequest) {
+				_ = s.Stream.Send(ctx, r)
+			}(st, req)
 		}
 	}
 
@@ -214,17 +224,10 @@ func (lf *LiveFlow) senderLoop(
 					}
 					fanOut(req)
 				default:
-					// Close all active streaming tools on shutdown.
-					for _, st := range invCtx.ActiveStreamingTools() {
-						st.Close()
-					}
 					return
 				}
 			}
 		case <-ctx.Done():
-			for _, st := range invCtx.ActiveStreamingTools() {
-				st.Close()
-			}
 			return
 		}
 	}
