@@ -423,6 +423,14 @@ func (r *Runner) RunLive(
 		// even when the consumer breaks (yield returns false → early return).
 		// WithoutCancel preserves context values (e.g. tenant identity for RLS)
 		// while surviving parent cancellation.
+		// Reorder state: buffer tool events that arrive during an active
+		// transcription so the completed transcript is persisted first.
+		var (
+			isInputTranscribing  bool
+			isOutputTranscribing bool
+			reorderBuffer        []*session.Event
+		)
+
 		defer func() {
 			flushCtx := context.WithoutCancel(ctx)
 			if inputTranscriptBuf.Len() > 0 {
@@ -435,6 +443,15 @@ func (r *Runner) RunLive(
 					log.Printf("failed to flush output transcript on exit: %v", err)
 				}
 			}
+			// Flush any reorder-buffered tool events on exit.
+			for _, buffered := range reorderBuffer {
+				persistEvent := *buffered
+				persistEvent.LiveDiagnostics = nil
+				if err := r.sessionService.AppendEvent(flushCtx, storedSession, &persistEvent); err != nil {
+					log.Printf("failed to flush reorder buffer on exit: %v", err)
+				}
+			}
+			reorderBuffer = nil
 		}()
 
 		for event, err := range r.rootAgent.Run(invCtx) {
@@ -456,6 +473,22 @@ func (r *Runner) RunLive(
 				if modifiedEvent != nil {
 					event = modifiedEvent
 				}
+			}
+
+			// Track per-stream transcription state for reordering.
+			if event.InputTranscription != nil {
+				isInputTranscribing = !event.InputTranscription.Finished
+			}
+			if event.OutputTranscription != nil {
+				isOutputTranscribing = !event.OutputTranscription.Finished
+			}
+			anyTranscribing := isInputTranscribing || isOutputTranscribing
+
+			// Buffer tool events during active transcription — do NOT yield
+			// them yet so the completed transcript is yielded first.
+			if anyTranscribing && isToolEvent(event) {
+				reorderBuffer = append(reorderBuffer, event)
+				continue
 			}
 
 			// TurnComplete is the natural boundary between speaking segments.
@@ -486,6 +519,25 @@ func (r *Runner) RunLive(
 				if !yield(event, nil) {
 					return
 				}
+				// Flush reorder buffer only when ALL transcription streams are done.
+				// Pop each item BEFORE persisting/yielding so an early return (consumer
+				// break or persist error) leaves only the unprocessed tail in the
+				// buffer — the defer flush picks it up, no double-append.
+				if !anyTranscribing {
+					for len(reorderBuffer) > 0 {
+						buffered := reorderBuffer[0]
+						reorderBuffer = reorderBuffer[1:]
+						persistEvent := *buffered
+						persistEvent.LiveDiagnostics = nil
+						if err := r.sessionService.AppendEvent(ctx, storedSession, &persistEvent); err != nil {
+							yield(nil, fmt.Errorf("failed to persist reordered event: %w", err))
+							return
+						}
+						if !yield(buffered, nil) {
+							return
+						}
+					}
+				}
 				continue
 			}
 
@@ -505,6 +557,25 @@ func (r *Runner) RunLive(
 				}
 				if !yield(event, nil) {
 					return
+				}
+				// Flush reorder buffer only when ALL transcription streams are done.
+				// Pop each item BEFORE persisting/yielding so an early return (consumer
+				// break or persist error) leaves only the unprocessed tail in the
+				// buffer — the defer flush picks it up, no double-append.
+				if !anyTranscribing {
+					for len(reorderBuffer) > 0 {
+						buffered := reorderBuffer[0]
+						reorderBuffer = reorderBuffer[1:]
+						persistEvent := *buffered
+						persistEvent.LiveDiagnostics = nil
+						if err := r.sessionService.AppendEvent(ctx, storedSession, &persistEvent); err != nil {
+							yield(nil, fmt.Errorf("failed to persist reordered event: %w", err))
+							return
+						}
+						if !yield(buffered, nil) {
+							return
+						}
+					}
 				}
 				continue
 			}
@@ -643,4 +714,9 @@ func (r *Runner) isTransferableAcrossAgentTree(agentToRun agent.Agent) bool {
 	}
 
 	return true
+}
+
+// isToolEvent returns true if the event contains function calls or responses.
+func isToolEvent(event *session.Event) bool {
+	return len(utils.FunctionCalls(event.Content)) > 0 || len(utils.FunctionResponses(event.Content)) > 0
 }
