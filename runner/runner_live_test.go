@@ -1214,3 +1214,78 @@ func TestScenario15_DeferFlushOnConsumerBreak(t *testing.T) {
 		t.Errorf("flushed author = %q, want agent name", persisted[0].Author)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 16: Activity signals flow through the live connection
+// ---------------------------------------------------------------------------
+
+func TestScenario16_ActivitySignals(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvCh = make(chan *model.LLMResponse, 10)
+
+	r, _, _ := setupRunner(t, conn, nil, nil)
+	queue := agent.NewLiveRequestQueue(100)
+
+	// Enqueue activity signals before starting the live session.
+	_ = queue.SendActivityStart(context.Background())
+	_ = queue.SendActivityEnd(context.Background())
+
+	go func() {
+		// Give sender loop time to process queued messages.
+		time.Sleep(100 * time.Millisecond)
+		conn.recvCh <- turnCompleteResponse()
+		time.Sleep(50 * time.Millisecond)
+		queue.Close()
+	}()
+
+	collectEvents(t, r, queue)
+
+	sendLog := conn.SendLog()
+
+	// Verify that ActivityStart and ActivityEnd requests were sent.
+	var gotStart, gotEnd bool
+	for _, req := range sendLog {
+		if req.ActivityStart {
+			gotStart = true
+		}
+		if req.ActivityEnd {
+			gotEnd = true
+		}
+	}
+	if !gotStart {
+		t.Error("expected ActivityStart request in send log")
+	}
+	if !gotEnd {
+		t.Error("expected ActivityEnd request in send log")
+	}
+
+	// Verify ordering: ActivityStart before ActivityEnd.
+	startIdx, endIdx := -1, -1
+	for i, req := range sendLog {
+		if req.ActivityStart && startIdx == -1 {
+			startIdx = i
+		}
+		if req.ActivityEnd && endIdx == -1 {
+			endIdx = i
+		}
+	}
+	if startIdx >= 0 && endIdx >= 0 && startIdx > endIdx {
+		t.Errorf("ActivityStart (idx=%d) should precede ActivityEnd (idx=%d)", startIdx, endIdx)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 17: Activity signals on a closed queue return ErrQueueClosed
+// ---------------------------------------------------------------------------
+
+func TestScenario17_ActivitySignalsClosedQueue(t *testing.T) {
+	queue := agent.NewLiveRequestQueue(10)
+	queue.Close()
+
+	if err := queue.SendActivityStart(context.Background()); err != agent.ErrQueueClosed {
+		t.Errorf("SendActivityStart on closed queue: got %v, want ErrQueueClosed", err)
+	}
+	if err := queue.SendActivityEnd(context.Background()); err != agent.ErrQueueClosed {
+		t.Errorf("SendActivityEnd on closed queue: got %v, want ErrQueueClosed", err)
+	}
+}
