@@ -494,6 +494,9 @@ func liveConfigFromRunConfig(rc *agent.RunConfig) *genai.LiveConnectConfig {
 	if rc.OutputAudioTranscription {
 		cfg.OutputAudioTranscription = &genai.AudioTranscriptionConfig{}
 	}
+	if rc.ContextWindowCompression != nil {
+		cfg.ContextWindowCompression = rc.ContextWindowCompression
+	}
 	if rc.ThinkingConfig != nil {
 		cfg.ThinkingConfig = rc.ThinkingConfig
 	}

@@ -40,6 +40,28 @@ func TestLiveConfigFromRunConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("context_window_compression_mapped", func(t *testing.T) {
+		trigger := int64(16000)
+		target := int64(8000)
+		rc := &agent.RunConfig{
+			ContextWindowCompression: &genai.ContextWindowCompressionConfig{
+				TriggerTokens: &trigger,
+				SlidingWindow: &genai.SlidingWindow{TargetTokens: &target},
+			},
+		}
+
+		got := liveConfigFromRunConfig(rc)
+		want := &genai.LiveConnectConfig{
+			ContextWindowCompression: &genai.ContextWindowCompressionConfig{
+				TriggerTokens: &trigger,
+				SlidingWindow: &genai.SlidingWindow{TargetTokens: &target},
+			},
+		}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Errorf("mismatch (-want +got):\n%s", diff)
+		}
+	})
+
 	t.Run("all_generation_params_mapped", func(t *testing.T) {
 		temp := float32(0.7)
 		topP := float32(0.9)

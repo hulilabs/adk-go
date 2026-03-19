@@ -48,6 +48,9 @@ type RunConfig struct {
 	OutputAudioTranscription bool
 	ToolCoalesceWindow       time.Duration // default 150ms if zero
 	LiveBufferSize           int           // default 100 if zero
+	// ContextWindowCompression configures automatic context window compression
+	// for long-running live sessions.
+	ContextWindowCompression *genai.ContextWindowCompressionConfig
 	// Generation parameters — applied to the live session config when set.
 	ThinkingConfig  *genai.ThinkingConfig
 	Temperature     *float32
