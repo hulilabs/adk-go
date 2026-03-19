@@ -94,6 +94,13 @@ type InvocationContext interface {
 	// Returns nil if not in live mode.
 	LiveRequestQueue() *LiveRequestQueue
 
+	// AddActiveStreamingTool registers a streaming tool that will receive
+	// duplicated live requests from the sender loop.
+	AddActiveStreamingTool(tool *ActiveStreamingTool)
+
+	// ActiveStreamingTools returns all registered active streaming tools.
+	ActiveStreamingTools() []*ActiveStreamingTool
+
 	// EndInvocation ends the current invocation. This stops any planned agent
 	// calls.
 	EndInvocation()

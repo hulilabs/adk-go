@@ -32,11 +32,12 @@ type InvocationContextParams struct {
 	Branch string
 	Agent  agent.Agent
 
-	UserContent      *genai.Content
-	RunConfig        *agent.RunConfig
-	EndInvocation    bool
-	InvocationID     string
-	LiveRequestQueue *agent.LiveRequestQueue
+	UserContent          *genai.Content
+	RunConfig            *agent.RunConfig
+	EndInvocation        bool
+	InvocationID         string
+	LiveRequestQueue     *agent.LiveRequestQueue
+	ActiveStreamingTools []*agent.ActiveStreamingTool
 }
 
 func NewInvocationContext(ctx context.Context, params InvocationContextParams) agent.InvocationContext {
@@ -89,6 +90,14 @@ func (c *InvocationContext) RunConfig() *agent.RunConfig {
 
 func (c *InvocationContext) LiveRequestQueue() *agent.LiveRequestQueue {
 	return c.params.LiveRequestQueue
+}
+
+func (c *InvocationContext) AddActiveStreamingTool(tool *agent.ActiveStreamingTool) {
+	c.params.ActiveStreamingTools = append(c.params.ActiveStreamingTools, tool)
+}
+
+func (c *InvocationContext) ActiveStreamingTools() []*agent.ActiveStreamingTool {
+	return c.params.ActiveStreamingTools
 }
 
 func (c *InvocationContext) EndInvocation() {

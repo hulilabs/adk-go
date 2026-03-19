@@ -107,7 +107,7 @@ func (lf *LiveFlow) RunLive(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lf.senderLoop(cancelCtx, conn, queue, eventCh)
+			lf.senderLoop(cancelCtx, ctx, conn, queue, eventCh)
 			// Close connection when sender is done (queue closed or error).
 			// This unblocks the receiver's conn.Receive without cancelling
 			// the context used by in-flight tool calls.
@@ -178,14 +178,23 @@ func (lf *LiveFlow) sendHistory(
 	return nil
 }
 
-// senderLoop forwards queue messages to the live connection.
+// senderLoop forwards queue messages to the live connection and fans out
+// each request to any active streaming tools registered on the invocation context.
 // On queue.Done(), it drains any remaining buffered messages before returning.
 func (lf *LiveFlow) senderLoop(
 	ctx context.Context,
+	invCtx agent.InvocationContext,
 	conn model.LiveConnection,
 	queue *agent.LiveRequestQueue,
 	eventCh chan<- eventOrError,
 ) {
+	fanOut := func(req *model.LiveRequest) {
+		for _, st := range invCtx.ActiveStreamingTools() {
+			// Best-effort: skip if the tool's queue is closed or full.
+			_ = st.Stream.Send(ctx, req)
+		}
+	}
+
 	for {
 		select {
 		case req := <-queue.Events():
@@ -193,6 +202,7 @@ func (lf *LiveFlow) senderLoop(
 				sendEvent(ctx, eventCh, eventOrError{err: err})
 				return
 			}
+			fanOut(req)
 		case <-queue.Done():
 			// Drain any buffered messages before exiting.
 			for {
@@ -202,11 +212,19 @@ func (lf *LiveFlow) senderLoop(
 						sendEvent(ctx, eventCh, eventOrError{err: err})
 						return
 					}
+					fanOut(req)
 				default:
+					// Close all active streaming tools on shutdown.
+					for _, st := range invCtx.ActiveStreamingTools() {
+						st.Close()
+					}
 					return
 				}
 			}
 		case <-ctx.Done():
+			for _, st := range invCtx.ActiveStreamingTools() {
+				st.Close()
+			}
 			return
 		}
 	}

@@ -434,12 +434,13 @@ type invocationContext struct {
 	memory    Memory
 	session   session.Session
 
-	invocationID     string
-	branch           string
-	userContent      *genai.Content
-	runConfig        *RunConfig
-	endInvocation    bool
-	liveRequestQueue *LiveRequestQueue
+	invocationID         string
+	branch               string
+	userContent          *genai.Content
+	runConfig            *RunConfig
+	endInvocation        bool
+	liveRequestQueue     *LiveRequestQueue
+	activeStreamingTools []*ActiveStreamingTool
 }
 
 func (c *invocationContext) Agent() Agent {
@@ -476,6 +477,14 @@ func (c *invocationContext) RunConfig() *RunConfig {
 
 func (c *invocationContext) LiveRequestQueue() *LiveRequestQueue {
 	return c.liveRequestQueue
+}
+
+func (c *invocationContext) AddActiveStreamingTool(tool *ActiveStreamingTool) {
+	c.activeStreamingTools = append(c.activeStreamingTools, tool)
+}
+
+func (c *invocationContext) ActiveStreamingTools() []*ActiveStreamingTool {
+	return c.activeStreamingTools
 }
 
 func (c *invocationContext) EndInvocation() {
