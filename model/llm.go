@@ -93,6 +93,12 @@ type LiveRequest struct {
 	RealtimeInput *genai.LiveRealtimeInput
 	ToolResponse  []*genai.FunctionResponse
 	Close         bool
+	// ActivityStart signals that user activity has begun (manual VAD).
+	// Only valid when automatic activity detection is disabled.
+	ActivityStart bool
+	// ActivityEnd signals that user activity has ended (manual VAD).
+	// Only valid when automatic activity detection is disabled.
+	ActivityEnd bool
 	// TurnComplete controls whether the model should respond after this content.
 	// nil defaults to true (backwards compatible). Set to false when sending
 	// history turns that the model should absorb without responding.

@@ -43,6 +43,14 @@ func (c *geminiLiveConnection) Send(_ context.Context, req *model.LiveRequest) e
 		return c.session.SendToolResponse(genai.LiveToolResponseInput{
 			FunctionResponses: req.ToolResponse,
 		})
+	case req.ActivityStart:
+		return c.session.SendRealtimeInput(genai.LiveRealtimeInput{
+			ActivityStart: &genai.ActivityStart{},
+		})
+	case req.ActivityEnd:
+		return c.session.SendRealtimeInput(genai.LiveRealtimeInput{
+			ActivityEnd: &genai.ActivityEnd{},
+		})
 	case req.RealtimeInput != nil:
 		return c.session.SendRealtimeInput(genai.LiveRealtimeInput{
 			Media: req.RealtimeInput.Media,

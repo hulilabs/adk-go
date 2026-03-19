@@ -97,6 +97,16 @@ func (q *LiveRequestQueue) Done() <-chan struct{} {
 	return q.done
 }
 
+// SendActivityStart enqueues an activity-start signal for manual VAD control.
+func (q *LiveRequestQueue) SendActivityStart(ctx context.Context) error {
+	return q.Send(ctx, &model.LiveRequest{ActivityStart: true})
+}
+
+// SendActivityEnd enqueues an activity-end signal for manual VAD control.
+func (q *LiveRequestQueue) SendActivityEnd(ctx context.Context) error {
+	return q.Send(ctx, &model.LiveRequest{ActivityEnd: true})
+}
+
 // ModelSpeaking returns whether the model is currently producing audio output.
 func (q *LiveRequestQueue) ModelSpeaking() bool {
 	return atomic.LoadInt32(&q.modelSpeaking) == 1
