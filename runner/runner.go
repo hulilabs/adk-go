@@ -318,6 +318,16 @@ func (r *Runner) RunLive(
 	cfg agent.RunConfig,
 ) iter.Seq2[*session.Event, error] {
 	cfg.StreamingMode = agent.StreamingModeBidi
+
+	// Auto-enable transcription for multi-agent live sessions so that
+	// sub-agents can consume text representations of audio turns.
+	if len(r.rootAgent.SubAgents()) > 0 && !cfg.InputAudioTranscription {
+		cfg.InputAudioTranscription = true
+	}
+	if len(r.rootAgent.SubAgents()) > 0 && !cfg.OutputAudioTranscription && hasAudioModality(cfg.ResponseModalities) {
+		cfg.OutputAudioTranscription = true
+	}
+
 	return func(yield func(*session.Event, error) bool) {
 		resp, err := r.sessionService.Get(ctx, &session.GetRequest{
 			AppName:   r.appName,
@@ -595,4 +605,13 @@ func findAgent(curAgent agent.Agent, targetName string) agent.Agent {
 		}
 	}
 	return nil
+}
+
+func hasAudioModality(modalities []genai.Modality) bool {
+	for _, m := range modalities {
+		if m == genai.ModalityAudio {
+			return true
+		}
+	}
+	return false
 }
