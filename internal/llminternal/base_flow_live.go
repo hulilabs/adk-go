@@ -104,10 +104,15 @@ func (lf *LiveFlow) RunLive(
 			flushCh:        make(chan struct{}, 1),
 		}
 
+		var acm *AudioCacheManager
+		if rc := ctx.RunConfig(); rc != nil && rc.SaveLiveBlob {
+			acm = NewAudioCacheManager()
+		}
+
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lf.senderLoop(cancelCtx, conn, queue, eventCh)
+			lf.senderLoop(cancelCtx, conn, queue, acm, eventCh)
 			// Close connection when sender is done (queue closed or error).
 			// This unblocks the receiver's conn.Receive without cancelling
 			// the context used by in-flight tool calls.
@@ -117,7 +122,7 @@ func (lf *LiveFlow) RunLive(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lf.receiverLoop(cancelCtx, ctx, conn, queue, cs, toolsFuncMap, eventCh, &wg)
+			lf.receiverLoop(cancelCtx, ctx, conn, queue, cs, toolsFuncMap, acm, eventCh, &wg)
 		}()
 
 		// Closer goroutine: eventCh is closed only after ALL producers
@@ -184,8 +189,16 @@ func (lf *LiveFlow) senderLoop(
 	ctx context.Context,
 	conn model.LiveConnection,
 	queue *agent.LiveRequestQueue,
+	acm *AudioCacheManager,
 	eventCh chan<- eventOrError,
 ) {
+	cacheInputAudio := func(req *model.LiveRequest) {
+		if acm == nil || req.RealtimeInput == nil || req.RealtimeInput.Audio == nil {
+			return
+		}
+		acm.CacheAudio(req.RealtimeInput.Audio.Data, req.RealtimeInput.Audio.MIMEType, CacheInput)
+	}
+
 	for {
 		select {
 		case req := <-queue.Events():
@@ -193,6 +206,7 @@ func (lf *LiveFlow) senderLoop(
 				sendEvent(ctx, eventCh, eventOrError{err: err})
 				return
 			}
+			cacheInputAudio(req)
 		case <-queue.Done():
 			// Drain any buffered messages before exiting.
 			for {
@@ -202,6 +216,7 @@ func (lf *LiveFlow) senderLoop(
 						sendEvent(ctx, eventCh, eventOrError{err: err})
 						return
 					}
+					cacheInputAudio(req)
 				default:
 					return
 				}
@@ -257,6 +272,7 @@ func (lf *LiveFlow) receiverLoop(
 	queue *agent.LiveRequestQueue,
 	cs *coalesceState,
 	toolsFuncMap map[string]toolinternal.FunctionTool,
+	acm *AudioCacheManager,
 	eventCh chan<- eventOrError,
 	wg *sync.WaitGroup,
 ) {
@@ -266,7 +282,7 @@ func (lf *LiveFlow) receiverLoop(
 	for {
 		select {
 		case r := <-recvCh:
-			if done := lf.handleRecv(ctx, invCtx, conn, queue, cs, toolsFuncMap, r, eventCh); done {
+			if done := lf.handleRecv(ctx, invCtx, conn, queue, cs, toolsFuncMap, acm, r, eventCh); done {
 				return
 			}
 		case <-cs.flushCh:
@@ -294,6 +310,7 @@ func (lf *LiveFlow) handleRecv(
 	queue *agent.LiveRequestQueue,
 	cs *coalesceState,
 	toolsFuncMap map[string]toolinternal.FunctionTool,
+	acm *AudioCacheManager,
 	r recvResult,
 	eventCh chan<- eventOrError,
 ) bool {
@@ -304,7 +321,7 @@ func (lf *LiveFlow) handleRecv(
 		sendEvent(ctx, eventCh, eventOrError{err: r.err})
 		return true
 	}
-	lf.processMessage(ctx, invCtx, conn, queue, cs, toolsFuncMap, r.resp, eventCh)
+	lf.processMessage(ctx, invCtx, conn, queue, cs, toolsFuncMap, acm, r.resp, eventCh)
 	return false
 }
 
@@ -315,6 +332,7 @@ func (lf *LiveFlow) processMessage(
 	queue *agent.LiveRequestQueue,
 	cs *coalesceState,
 	toolsFuncMap map[string]toolinternal.FunctionTool,
+	acm *AudioCacheManager,
 	resp *model.LLMResponse,
 	eventCh chan<- eventOrError,
 ) {
@@ -337,11 +355,32 @@ func (lf *LiveFlow) processMessage(
 		}
 	}
 
+	// Cache output audio for blob persistence.
+	if isAudio && acm != nil && resp.Content != nil {
+		for _, part := range resp.Content.Parts {
+			if part.InlineData != nil {
+				acm.CacheAudio(part.InlineData.Data, part.InlineData.MIMEType, CacheOutput)
+			}
+		}
+	}
+
 	if isAudio {
 		queue.SetModelSpeaking(true)
 	}
 	if resp.TurnComplete || resp.Interrupted {
 		queue.SetModelSpeaking(false)
+	}
+
+	// Flush audio caches at turn boundaries.
+	if acm != nil && (resp.TurnComplete || resp.Interrupted) {
+		if resp.TurnComplete {
+			if ev := acm.FlushInput(ctx, invCtx); ev != nil {
+				sendEvent(ctx, eventCh, eventOrError{event: ev})
+			}
+		}
+		if ev := acm.FlushOutput(ctx, invCtx); ev != nil {
+			sendEvent(ctx, eventCh, eventOrError{event: ev})
+		}
 	}
 
 	ev := session.NewEvent(invCtx.InvocationID())

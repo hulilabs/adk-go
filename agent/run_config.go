@@ -48,6 +48,10 @@ type RunConfig struct {
 	OutputAudioTranscription bool
 	ToolCoalesceWindow       time.Duration // default 150ms if zero
 	LiveBufferSize           int           // default 100 if zero
+	// SaveLiveBlob enables caching and persisting audio blobs during live
+	// sessions. Input and output audio chunks are accumulated and saved as
+	// artifacts when a turn completes or is interrupted.
+	SaveLiveBlob bool
 	// Generation parameters — applied to the live session config when set.
 	ThinkingConfig  *genai.ThinkingConfig
 	Temperature     *float32
