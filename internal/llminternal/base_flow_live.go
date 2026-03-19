@@ -106,6 +106,10 @@ func (lf *LiveFlow) RunLive(
 				return
 			}
 
+			// Reset retry budget after a successful connection so that
+			// GoAway-triggered reconnects don't exhaust it.
+			attempt = 0
+
 			cancelCtx, cancel := context.WithCancel(ctx)
 
 			if err := lf.sendHistory(cancelCtx, ctx, conn); err != nil {
@@ -147,8 +151,13 @@ func (lf *LiveFlow) RunLive(
 				// Handle session resumption updates.
 				if msg.event != nil && msg.event.SessionResumptionUpdate != nil {
 					upd := msg.event.SessionResumptionUpdate
-					if upd.Resumable && upd.NewHandle != "" {
-						ctx.SetLiveSessionResumptionHandle(upd.NewHandle)
+					if upd.Resumable {
+						if upd.NewHandle != "" {
+							ctx.SetLiveSessionResumptionHandle(upd.NewHandle)
+						}
+					} else {
+						// Non-resumable: clear any stale handle.
+						ctx.SetLiveSessionResumptionHandle("")
 					}
 				}
 				// Handle GoAway: trigger reconnection.
