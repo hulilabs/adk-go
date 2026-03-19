@@ -41,6 +41,9 @@ type RunConfig struct {
 	// If true, ADK runner will save each part of the user input that is a blob
 	// (e.g., images, files) as an artifact.
 	SaveInputBlobsAsArtifacts bool
+	// SupportCFC enables Compositional Function Calling by redirecting the
+	// text generation path through the Live API. Only supported for gemini-2 models.
+	SupportCFC bool
 	// Live-specific configuration
 	ResponseModalities       []genai.Modality
 	SpeechConfig             *genai.SpeechConfig

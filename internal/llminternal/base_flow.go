@@ -22,6 +22,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"google.golang.org/genai"
@@ -95,6 +96,9 @@ var (
 )
 
 func (f *Flow) Run(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+	if rc := ctx.RunConfig(); rc != nil && rc.SupportCFC {
+		return f.runCFC(ctx)
+	}
 	return func(yield func(*session.Event, error) bool) {
 		for {
 			var lastEvent *session.Event
@@ -116,6 +120,93 @@ func (f *Flow) Run(ctx agent.InvocationContext) iter.Seq2[*session.Event, error]
 				// We may have reached max token limit during streaming mode.
 				// TODO: handle Partial response in model level. CL 781377328
 				yield(nil, fmt.Errorf("TODO: last event is not final"))
+				return
+			}
+		}
+	}
+}
+
+// runCFC redirects the text generation path through the Live API to enable
+// Compositional Function Calling. The model handles tool calls internally
+// within a single turn.
+func (f *Flow) runCFC(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+	return func(yield func(*session.Event, error) bool) {
+		if !strings.Contains(f.Model.Name(), "gemini-2") {
+			yield(nil, fmt.Errorf("compositional function calling (CFC) is only supported for gemini-2 models"))
+			return
+		}
+
+		liveLLM, ok := f.Model.(model.LiveCapableLLM)
+		if !ok {
+			yield(nil, fmt.Errorf("model %q does not support live connections required for CFC", f.Model.Name()))
+			return
+		}
+
+		// Build LLM request via the normal preprocessing pipeline so that
+		// instructions, tools, and contents are resolved.
+		req := &model.LLMRequest{Model: f.Model.Name()}
+		for _, err := range f.preprocess(ctx, req) {
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+		}
+
+		// Translate the preprocessed text-path request into a LiveConnectConfig.
+		liveCfg := &genai.LiveConnectConfig{
+			ResponseModalities: []genai.Modality{genai.ModalityText},
+		}
+		if req.Config != nil && req.Config.SystemInstruction != nil {
+			liveCfg.SystemInstruction = req.Config.SystemInstruction
+		}
+
+		// Convert tools from the preprocessed map to live tool declarations.
+		var decls []*genai.FunctionDeclaration
+		for _, v := range req.Tools {
+			type declarable interface {
+				Declaration() *genai.FunctionDeclaration
+			}
+			if dt, ok := v.(declarable); ok {
+				if d := dt.Declaration(); d != nil {
+					decls = append(decls, d)
+				}
+			}
+		}
+		if len(decls) > 0 {
+			liveCfg.Tools = []*genai.Tool{{FunctionDeclarations: decls}}
+		}
+
+		req.LiveConfig = liveCfg
+		conn, err := liveLLM.ConnectLive(ctx, req)
+		if err != nil {
+			yield(nil, fmt.Errorf("CFC: failed to connect live: %w", err))
+			return
+		}
+
+		// Create a temporary queue, seed it with the user content, and close
+		// it so the live flow processes exactly one turn.
+		queue := agent.NewLiveRequestQueue(16)
+		if ctx.UserContent() != nil {
+			_ = queue.Send(context.Background(), &model.LiveRequest{Content: ctx.UserContent()})
+		}
+		queue.Close()
+
+		coalesceWindow := 150 * time.Millisecond
+		if rc := ctx.RunConfig(); rc != nil && rc.ToolCoalesceWindow > 0 {
+			coalesceWindow = rc.ToolCoalesceWindow
+		}
+
+		lf := &LiveFlow{
+			Model:                f.Model,
+			Tools:                f.Tools,
+			BeforeToolCallbacks:  f.BeforeToolCallbacks,
+			AfterToolCallbacks:   f.AfterToolCallbacks,
+			OnToolErrorCallbacks: f.OnToolErrorCallbacks,
+			CoalesceWindow:       coalesceWindow,
+		}
+
+		for ev, err := range lf.RunLive(ctx, conn, queue) {
+			if !yield(ev, err) {
 				return
 			}
 		}
