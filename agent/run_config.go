@@ -54,4 +54,11 @@ type RunConfig struct {
 	TopP            *float32
 	TopK            *float32
 	MaxOutputTokens *int32
+
+	// Live session capabilities (require genai v1.51.0).
+	RealtimeInputConfig      *genai.RealtimeInputConfig
+	Proactivity              *genai.ProactivityConfig
+	EnableAffectiveDialog    *bool
+	ContextWindowCompression *genai.ContextWindowCompressionConfig
+	SessionResumption        *genai.SessionResumptionConfig
 }

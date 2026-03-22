@@ -1214,3 +1214,56 @@ func TestScenario15_DeferFlushOnConsumerBreak(t *testing.T) {
 		t.Errorf("flushed author = %q, want agent name", persisted[0].Author)
 	}
 }
+
+func TestRunLive_LiveDiagnostics_NotLeakedToSession(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{
+		textResponse("hello from model"),
+	}
+	r, svc, sess := setupRunner(t, conn, nil, nil)
+
+	queue := agent.NewLiveRequestQueue(10)
+	queue.Close()
+
+	var yieldedEvents []*session.Event
+	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ev != nil {
+			yieldedEvents = append(yieldedEvents, ev)
+		}
+	}
+
+	if len(yieldedEvents) == 0 {
+		t.Fatal("expected at least one yielded event")
+	}
+
+	// Yielded events should carry LiveDiagnostics.
+	for i, ev := range yieldedEvents {
+		if ev.LiveDiagnostics == nil && ev.Content != nil && len(ev.Content.Parts) > 0 {
+			t.Errorf("yielded event[%d] should have LiveDiagnostics", i)
+		}
+	}
+
+	// Persisted events must NOT have LiveDiagnostics.
+	for i, ev := range svc.PersistedEvents() {
+		if ev.LiveDiagnostics != nil {
+			t.Errorf("persisted event[%d] has LiveDiagnostics, want nil", i)
+		}
+	}
+
+	// Events in the session (via ctx.Session().Events()) must NOT have LiveDiagnostics.
+	// Re-fetch the session to see what's stored.
+	getResp, err := svc.Get(context.Background(), &session.GetRequest{
+		AppName: "test", UserID: "user1", SessionID: sess.ID(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ev := range getResp.Session.Events().All() {
+		if ev.LiveDiagnostics != nil {
+			t.Errorf("session event %q has LiveDiagnostics, want nil", ev.ID)
+		}
+	}
+}
