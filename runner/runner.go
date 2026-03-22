@@ -493,6 +493,10 @@ func (r *Runner) RunLive(
 			}
 
 			// Persist non-partial, non-audio, non-transcript events with actual content.
+			// Use a shallow copy so that the original event retains LiveDiagnostics
+			// for the caller, while the persisted copy has it nil. Without the copy,
+			// AppendEvent stores the same pointer in the session's event list,
+			// leaking the ephemeral field into ctx.Session().Events().
 			isAudio := false
 			if meta := event.CustomMetadata; meta != nil {
 				if v, ok := meta["is_audio"].(bool); ok {
@@ -501,7 +505,9 @@ func (r *Runner) RunLive(
 			}
 			hasContent := event.Content != nil && len(event.Content.Parts) > 0
 			if !event.Partial && !isAudio && hasContent {
-				if err := r.sessionService.AppendEvent(ctx, storedSession, event); err != nil {
+				persistEvent := *event
+				persistEvent.LiveDiagnostics = nil
+				if err := r.sessionService.AppendEvent(ctx, storedSession, &persistEvent); err != nil {
 					yield(nil, fmt.Errorf("failed to add event to session: %w", err))
 					return
 				}

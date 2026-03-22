@@ -509,7 +509,27 @@ func liveConfigFromRunConfig(rc *agent.RunConfig) *genai.LiveConnectConfig {
 	if rc.MaxOutputTokens != nil {
 		cfg.MaxOutputTokens = *rc.MaxOutputTokens
 	}
+	applyLiveCapabilities(rc, cfg)
 	return cfg
+}
+
+// applyLiveCapabilities maps v1.51.0 live session capabilities from RunConfig.
+func applyLiveCapabilities(rc *agent.RunConfig, cfg *genai.LiveConnectConfig) {
+	if rc.RealtimeInputConfig != nil {
+		cfg.RealtimeInputConfig = rc.RealtimeInputConfig
+	}
+	if rc.Proactivity != nil {
+		cfg.Proactivity = rc.Proactivity
+	}
+	if rc.EnableAffectiveDialog != nil {
+		cfg.EnableAffectiveDialog = rc.EnableAffectiveDialog
+	}
+	if rc.ContextWindowCompression != nil {
+		cfg.ContextWindowCompression = rc.ContextWindowCompression
+	}
+	if rc.SessionResumption != nil {
+		cfg.SessionResumption = rc.SessionResumption
+	}
 }
 
 type declarable interface {

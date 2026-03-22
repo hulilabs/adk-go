@@ -64,6 +64,53 @@ type recvResult struct {
 	err  error
 }
 
+type liveTimingState struct {
+	mu            sync.Mutex
+	lastEventTime time.Time
+	lastSendTime  time.Time
+}
+
+func (s *liveTimingState) recordSend(t time.Time) {
+	s.mu.Lock()
+	s.lastSendTime = t
+	s.mu.Unlock()
+}
+
+// trackedSend wraps conn.Send, stamping SentAt on the request and
+// recording the send time in shared timing state.
+func trackedSend(ctx context.Context, conn model.LiveConnection, req *model.LiveRequest, ts *liveTimingState) error {
+	now := time.Now()
+	req.SentAt = now
+	ts.recordSend(now)
+	return conn.Send(ctx, req)
+}
+
+// buildBaseDiagnostics creates a LiveDiagnostics with timing fields that
+// apply to all event types (function-call, function-response, and content).
+func buildBaseDiagnostics(
+	queue *agent.LiveRequestQueue,
+	ts *liveTimingState,
+	receivedAt time.Time,
+	eventTime time.Time,
+) *session.LiveDiagnostics {
+	diag := &session.LiveDiagnostics{
+		ModelSpeaking: queue.ModelSpeaking(),
+		QueueDepth:    queue.Len(),
+	}
+
+	ts.mu.Lock()
+	if !ts.lastEventTime.IsZero() {
+		diag.TimeSinceLastEvent = eventTime.Sub(ts.lastEventTime)
+	}
+	ts.lastEventTime = eventTime
+	if !ts.lastSendTime.IsZero() && !receivedAt.IsZero() {
+		diag.TimeSinceLastSend = receivedAt.Sub(ts.lastSendTime)
+	}
+	ts.mu.Unlock()
+
+	return diag
+}
+
 // sendEvent sends a message to eventCh, aborting if ctx is cancelled.
 // This prevents goroutines from blocking on a full channel after shutdown.
 func sendEvent(ctx context.Context, eventCh chan<- eventOrError, msg eventOrError) {
@@ -90,7 +137,9 @@ func (lf *LiveFlow) RunLive(
 			}
 		}
 
-		if err := lf.sendHistory(cancelCtx, ctx, conn); err != nil {
+		ts := &liveTimingState{}
+
+		if err := lf.sendHistory(cancelCtx, ctx, conn, ts); err != nil {
 			yield(nil, fmt.Errorf("history handoff failed: %w", err))
 			return
 		}
@@ -107,7 +156,7 @@ func (lf *LiveFlow) RunLive(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lf.senderLoop(cancelCtx, conn, queue, eventCh)
+			lf.senderLoop(cancelCtx, conn, queue, ts, eventCh)
 			// Close connection when sender is done (queue closed or error).
 			// This unblocks the receiver's conn.Receive without cancelling
 			// the context used by in-flight tool calls.
@@ -117,7 +166,7 @@ func (lf *LiveFlow) RunLive(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lf.receiverLoop(cancelCtx, ctx, conn, queue, cs, toolsFuncMap, eventCh, &wg)
+			lf.receiverLoop(cancelCtx, ctx, conn, queue, cs, toolsFuncMap, ts, eventCh, &wg)
 		}()
 
 		// Closer goroutine: eventCh is closed only after ALL producers
@@ -144,6 +193,7 @@ func (lf *LiveFlow) sendHistory(
 	cancelCtx context.Context,
 	ctx agent.InvocationContext,
 	conn model.LiveConnection,
+	ts *liveTimingState,
 ) error {
 	events := ctx.Session().Events()
 
@@ -171,7 +221,7 @@ func (lf *LiveFlow) sendHistory(
 			req.TurnComplete = &falseVal
 		}
 		// Last turn uses default (TurnComplete=nil → true).
-		if err := conn.Send(cancelCtx, req); err != nil {
+		if err := trackedSend(cancelCtx, conn, req, ts); err != nil {
 			return err
 		}
 	}
@@ -184,29 +234,40 @@ func (lf *LiveFlow) senderLoop(
 	ctx context.Context,
 	conn model.LiveConnection,
 	queue *agent.LiveRequestQueue,
+	ts *liveTimingState,
 	eventCh chan<- eventOrError,
 ) {
 	for {
 		select {
 		case req := <-queue.Events():
-			if err := conn.Send(ctx, req); err != nil {
+			if err := trackedSend(ctx, conn, req, ts); err != nil {
 				sendEvent(ctx, eventCh, eventOrError{err: err})
 				return
 			}
 		case <-queue.Done():
-			// Drain any buffered messages before exiting.
-			for {
-				select {
-				case req := <-queue.Events():
-					if err := conn.Send(ctx, req); err != nil {
-						sendEvent(ctx, eventCh, eventOrError{err: err})
-						return
-					}
-				default:
-					return
-				}
-			}
+			lf.drainQueue(ctx, conn, queue, ts, eventCh)
+			return
 		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (lf *LiveFlow) drainQueue(
+	ctx context.Context,
+	conn model.LiveConnection,
+	queue *agent.LiveRequestQueue,
+	ts *liveTimingState,
+	eventCh chan<- eventOrError,
+) {
+	for {
+		select {
+		case req := <-queue.Events():
+			if err := trackedSend(ctx, conn, req, ts); err != nil {
+				sendEvent(ctx, eventCh, eventOrError{err: err})
+				return
+			}
+		default:
 			return
 		}
 	}
@@ -257,6 +318,7 @@ func (lf *LiveFlow) receiverLoop(
 	queue *agent.LiveRequestQueue,
 	cs *coalesceState,
 	toolsFuncMap map[string]toolinternal.FunctionTool,
+	ts *liveTimingState,
 	eventCh chan<- eventOrError,
 	wg *sync.WaitGroup,
 ) {
@@ -266,11 +328,11 @@ func (lf *LiveFlow) receiverLoop(
 	for {
 		select {
 		case r := <-recvCh:
-			if done := lf.handleRecv(ctx, invCtx, conn, queue, cs, toolsFuncMap, r, eventCh); done {
+			if done := lf.handleRecv(ctx, invCtx, conn, queue, cs, toolsFuncMap, ts, r, eventCh); done {
 				return
 			}
 		case <-cs.flushCh:
-			lf.flushToolCalls(ctx, invCtx, conn, cs, toolsFuncMap, eventCh)
+			lf.flushToolCalls(ctx, invCtx, conn, cs, toolsFuncMap, ts, queue, eventCh)
 		case <-ctx.Done():
 			return
 		}
@@ -294,6 +356,7 @@ func (lf *LiveFlow) handleRecv(
 	queue *agent.LiveRequestQueue,
 	cs *coalesceState,
 	toolsFuncMap map[string]toolinternal.FunctionTool,
+	ts *liveTimingState,
 	r recvResult,
 	eventCh chan<- eventOrError,
 ) bool {
@@ -304,7 +367,7 @@ func (lf *LiveFlow) handleRecv(
 		sendEvent(ctx, eventCh, eventOrError{err: r.err})
 		return true
 	}
-	lf.processMessage(ctx, invCtx, conn, queue, cs, toolsFuncMap, r.resp, eventCh)
+	lf.processMessage(ctx, invCtx, conn, queue, cs, toolsFuncMap, ts, r.resp, eventCh)
 	return false
 }
 
@@ -315,6 +378,7 @@ func (lf *LiveFlow) processMessage(
 	queue *agent.LiveRequestQueue,
 	cs *coalesceState,
 	toolsFuncMap map[string]toolinternal.FunctionTool,
+	ts *liveTimingState,
 	resp *model.LLMResponse,
 	eventCh chan<- eventOrError,
 ) {
@@ -328,7 +392,7 @@ func (lf *LiveFlow) processMessage(
 		return
 	}
 
-	lf.flushCoalesceBuffer(ctx, invCtx, conn, cs, toolsFuncMap, eventCh)
+	lf.flushCoalesceBuffer(ctx, invCtx, conn, cs, toolsFuncMap, ts, queue, eventCh)
 
 	isAudio := false
 	if resp.CustomMetadata != nil {
@@ -355,7 +419,35 @@ func (lf *LiveFlow) processMessage(
 	}
 	ev.Branch = invCtx.Branch()
 	ev.LLMResponse = *resp
+
+	diag := buildBaseDiagnostics(queue, ts, resp.ReceivedAt, ev.Timestamp)
+	diag.ReceiveLatency = resp.ReceiveLatency
+	populateProtocolState(resp, diag)
+	ev.LiveDiagnostics = diag
+
 	sendEvent(ctx, eventCh, eventOrError{event: ev})
+}
+
+// populateProtocolState extracts protocol state from CustomMetadata into LiveDiagnostics.
+func populateProtocolState(resp *model.LLMResponse, diag *session.LiveDiagnostics) {
+	if reason, ok := resp.CustomMetadata["turn_complete_reason"].(string); ok {
+		diag.TurnCompleteReason = reason
+	}
+	if ms, ok := resp.CustomMetadata["go_away_time_left_ms"].(float64); ok {
+		diag.GoAwayTimeLeft = time.Duration(ms) * time.Millisecond
+	}
+	if vad, ok := resp.CustomMetadata["vad_signal_type"].(string); ok {
+		diag.VADSignalType = vad
+	}
+	if handle, ok := resp.CustomMetadata["session_resumption_handle"].(string); ok {
+		diag.SessionResumptionHandle = handle
+	}
+	if resumable, ok := resp.CustomMetadata["session_resumption_resumable"].(bool); ok {
+		diag.SessionResumable = resumable
+	}
+	if wi, ok := resp.CustomMetadata["waiting_for_input"].(bool); ok {
+		diag.WaitingForInput = wi
+	}
 }
 
 func hasFunctionCallParts(resp *model.LLMResponse) bool {
@@ -422,6 +514,8 @@ func (lf *LiveFlow) flushCoalesceBuffer(
 	conn model.LiveConnection,
 	cs *coalesceState,
 	toolsFuncMap map[string]toolinternal.FunctionTool,
+	ts *liveTimingState,
+	queue *agent.LiveRequestQueue,
 	eventCh chan<- eventOrError,
 ) {
 	cs.mu.Lock()
@@ -440,7 +534,7 @@ func (lf *LiveFlow) flushCoalesceBuffer(
 	if empty {
 		return
 	}
-	lf.flushToolCalls(ctx, invCtx, conn, cs, toolsFuncMap, eventCh)
+	lf.flushToolCalls(ctx, invCtx, conn, cs, toolsFuncMap, ts, queue, eventCh)
 }
 
 func (lf *LiveFlow) flushToolCalls(
@@ -449,6 +543,8 @@ func (lf *LiveFlow) flushToolCalls(
 	conn model.LiveConnection,
 	cs *coalesceState,
 	toolsFuncMap map[string]toolinternal.FunctionTool,
+	ts *liveTimingState,
+	queue *agent.LiveRequestQueue,
 	eventCh chan<- eventOrError,
 ) {
 	calls := lf.collectBufferedCalls(cs)
@@ -457,18 +553,22 @@ func (lf *LiveFlow) flushToolCalls(
 	}
 
 	groups := deduplicateCalls(calls)
-	lf.emitFunctionCallEvent(ctx, invCtx, calls, eventCh)
+	lf.emitFunctionCallEvent(ctx, invCtx, calls, queue, ts, eventCh)
+
+	toolStart := time.Now()
 	responses := lf.executeToolGroups(ctx, invCtx, cs, groups, toolsFuncMap)
+	toolExecTime := time.Since(toolStart)
 
 	if len(responses) == 0 {
 		return
 	}
 
-	if err := conn.Send(ctx, &model.LiveRequest{ToolResponse: responses}); err != nil {
+	req := &model.LiveRequest{ToolResponse: responses}
+	if err := trackedSend(ctx, conn, req, ts); err != nil {
 		eventCh <- eventOrError{err: fmt.Errorf("failed to send tool response: %w", err)}
 		return
 	}
-	lf.emitFunctionResponseEvent(ctx, invCtx, responses, eventCh)
+	lf.emitFunctionResponseEvent(ctx, invCtx, responses, queue, ts, toolExecTime, eventCh)
 }
 
 func (lf *LiveFlow) collectBufferedCalls(cs *coalesceState) map[string]*genai.FunctionCall {
@@ -512,6 +612,8 @@ func (lf *LiveFlow) emitFunctionCallEvent(
 	ctx context.Context,
 	invCtx agent.InvocationContext,
 	calls map[string]*genai.FunctionCall,
+	queue *agent.LiveRequestQueue,
+	ts *liveTimingState,
 	eventCh chan<- eventOrError,
 ) {
 	fcParts := make([]*genai.Part, 0, len(calls))
@@ -524,6 +626,9 @@ func (lf *LiveFlow) emitFunctionCallEvent(
 	ev.LLMResponse = model.LLMResponse{
 		Content: &genai.Content{Role: "model", Parts: fcParts},
 	}
+	// ReceivedAt is zero for FC events (they aren't from conn.Receive),
+	// so TimeSinceLastSend will be zero (guarded by !receivedAt.IsZero()).
+	ev.LiveDiagnostics = buildBaseDiagnostics(queue, ts, time.Time{}, ev.Timestamp)
 	sendEvent(ctx, eventCh, eventOrError{event: ev})
 }
 
@@ -571,6 +676,9 @@ func (lf *LiveFlow) emitFunctionResponseEvent(
 	ctx context.Context,
 	invCtx agent.InvocationContext,
 	responses []*genai.FunctionResponse,
+	queue *agent.LiveRequestQueue,
+	ts *liveTimingState,
+	toolExecTime time.Duration,
 	eventCh chan<- eventOrError,
 ) {
 	frParts := make([]*genai.Part, 0, len(responses))
@@ -583,6 +691,9 @@ func (lf *LiveFlow) emitFunctionResponseEvent(
 	ev.LLMResponse = model.LLMResponse{
 		Content: &genai.Content{Role: "user", Parts: frParts},
 	}
+	diag := buildBaseDiagnostics(queue, ts, time.Time{}, ev.Timestamp)
+	diag.ToolExecutionTime = toolExecTime
+	ev.LiveDiagnostics = diag
 	sendEvent(ctx, eventCh, eventOrError{event: ev})
 }
 
