@@ -422,6 +422,12 @@ func (a *llmAgent) runLive(ctx agent.InvocationContext) iter.Seq2[*session.Event
 	}
 
 	req := &model.LLMRequest{Model: a.model.Name()}
+	// Allow per-run model override (e.g. switching voice models without
+	// rebuilding the agent tree). The gemini layer's modelName() already
+	// prefers req.Model over the construction-time name.
+	if ctx.RunConfig() != nil && ctx.RunConfig().Model != "" {
+		req.Model = ctx.RunConfig().Model
+	}
 	if ctx.RunConfig() != nil {
 		req.LiveConfig = liveConfigFromRunConfig(ctx.RunConfig())
 	}
