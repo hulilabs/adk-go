@@ -388,8 +388,9 @@ func (r *Runner) RunLive(
 			}
 		}
 
-		// Transcription buffers: accumulate chunks until Finished=true,
-		// then persist one aggregated event per transcription turn.
+		// Transcription buffers: accumulate chunks until Finished=true.
+		// For input, also flush on speaker boundary (model starts speaking/acting)
+		// or TurnComplete, then persist one aggregated event per turn.
 		var inputTranscriptBuf strings.Builder
 		var outputTranscriptBuf strings.Builder
 
@@ -461,6 +462,14 @@ func (r *Runner) RunLive(
 			// Check BEFORE transcription handling so that an event carrying both
 			// OutputTranscription and TurnComplete=true doesn't skip this flush
 			// due to the continue in the transcription block.
+			// Flush input buffer first (user speech before model response),
+			// then output buffer.
+			if event.TurnComplete && inputTranscriptBuf.Len() > 0 {
+				if err := persistTranscript(ctx, &inputTranscriptBuf, "user", "user"); err != nil {
+					yield(nil, fmt.Errorf("failed to persist input transcript on turn complete: %w", err))
+					return
+				}
+			}
 			if event.TurnComplete && outputTranscriptBuf.Len() > 0 {
 				if err := persistTranscript(ctx, &outputTranscriptBuf, invCtx.Agent().Name(), "model"); err != nil {
 					yield(nil, fmt.Errorf("failed to persist output transcript on turn complete: %w", err))
@@ -478,6 +487,14 @@ func (r *Runner) RunLive(
 					return
 				}
 				continue
+			}
+
+			// Cross-speaker boundary: model starts speaking → flush user input first.
+			if event.OutputTranscription != nil && inputTranscriptBuf.Len() > 0 {
+				if err := persistTranscript(ctx, &inputTranscriptBuf, "user", "user"); err != nil {
+					yield(nil, fmt.Errorf("failed to persist input transcript before output: %w", err))
+					return
+				}
 			}
 
 			// Handle output transcription: buffer chunks, persist on Finished.
@@ -504,6 +521,13 @@ func (r *Runner) RunLive(
 				}
 			}
 			hasContent := event.Content != nil && len(event.Content.Parts) > 0
+			// Cross-speaker boundary: model sends content (e.g. tool call) → flush user input first.
+			if !event.Partial && !isAudio && hasContent && inputTranscriptBuf.Len() > 0 {
+				if err := persistTranscript(ctx, &inputTranscriptBuf, "user", "user"); err != nil {
+					yield(nil, fmt.Errorf("failed to persist input transcript before content: %w", err))
+					return
+				}
+			}
 			if !event.Partial && !isAudio && hasContent {
 				persistEvent := *event
 				persistEvent.LiveDiagnostics = nil
