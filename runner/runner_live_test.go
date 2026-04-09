@@ -1709,3 +1709,348 @@ func TestScenario24_PostInterruptedKnownLimitation(t *testing.T) {
 		t.Error("ModelSpeaking should be false: Interrupted must call SetModelSpeaking(false)")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 25: InputTranscription flushed before OutputTranscription
+// ---------------------------------------------------------------------------
+
+func TestScenario25_InputFlushedBeforeOutput(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{
+		transcriptResponse("Hello ", "input", false),
+		transcriptResponse("world", "input", false),
+		transcriptResponse("Hi!", "output", true),
+		turnCompleteResponse(),
+	}
+
+	r, svc, _ := setupRunner(t, conn, nil, nil)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	events, errs := collectEvents(t, r, queue)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(events) != 4 {
+		t.Fatalf("expected 4 yielded events, got %d", len(events))
+	}
+
+	persisted := svc.PersistedEvents()
+	texts := persistedTexts(persisted)
+	if len(texts) != 2 || texts[0] != "Hello world" || texts[1] != "Hi!" {
+		t.Fatalf("expected [Hello world, Hi!], got %v", texts)
+	}
+
+	// First persisted event must be user input.
+	if persisted[0].Author != "user" {
+		t.Errorf("first persisted Author = %q, want %q", persisted[0].Author, "user")
+	}
+	if persisted[0].Content.Role != "user" {
+		t.Errorf("first persisted Role = %q, want %q", persisted[0].Content.Role, "user")
+	}
+	// Second persisted event must be agent output.
+	if persisted[1].Author != "test_agent" {
+		t.Errorf("second persisted Author = %q, want %q", persisted[1].Author, "test_agent")
+	}
+	if persisted[1].Content.Role != "model" {
+		t.Errorf("second persisted Role = %q, want %q", persisted[1].Content.Role, "model")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 26: InputTranscription flushed before Content (tool call)
+// ---------------------------------------------------------------------------
+
+func TestScenario26_InputFlushedBeforeToolCall(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{
+		transcriptResponse("Check patient", "input", false),
+		functionCallResponse("fc1", "lookup", map[string]any{}),
+		textResponse("Found"),
+		turnCompleteResponse(),
+	}
+
+	lookupTool := &mockTool{
+		name:   "lookup",
+		result: map[string]any{"status": "ok"},
+	}
+
+	r, svc, _ := setupRunner(t, conn, []tool.Tool{lookupTool}, nil)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	events, errs := collectEvents(t, r, queue)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	_ = events
+
+	persisted := svc.PersistedEvents()
+	texts := persistedTexts(persisted)
+
+	// "Check patient" must be the first persisted text.
+	if len(texts) == 0 || texts[0] != "Check patient" {
+		t.Fatalf("expected first persistedText = %q, got %v", "Check patient", texts)
+	}
+	if persisted[0].Author != "user" {
+		t.Errorf("first persisted Author = %q, want %q", persisted[0].Author, "user")
+	}
+
+	// Tool must have been called exactly once.
+	if lookupTool.CallCount() != 1 {
+		t.Errorf("expected lookup tool called once, got %d", lookupTool.CallCount())
+	}
+
+	// "Check patient" must appear before function call in persisted order.
+	fcIdx := -1
+	for i, ev := range persisted {
+		if ev.Content != nil {
+			for _, p := range ev.Content.Parts {
+				if p.FunctionCall != nil {
+					fcIdx = i
+					break
+				}
+			}
+		}
+		if fcIdx >= 0 {
+			break
+		}
+	}
+	if fcIdx < 0 {
+		t.Fatal("expected a function call in persisted events")
+	}
+	if fcIdx <= 0 {
+		t.Error("function call should appear after user transcript in persisted order")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 27: InputTranscription flushed on TurnComplete (no other boundary)
+// ---------------------------------------------------------------------------
+
+func TestScenario27_InputFlushedOnTurnComplete(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{
+		transcriptResponse("Hello", "input", false),
+		turnCompleteResponse(),
+	}
+
+	r, svc, _ := setupRunner(t, conn, nil, nil)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	events, errs := collectEvents(t, r, queue)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 yielded events, got %d", len(events))
+	}
+
+	persisted := svc.PersistedEvents()
+	texts := persistedTexts(persisted)
+	if len(texts) != 1 || texts[0] != "Hello" {
+		t.Fatalf("expected [Hello], got %v", texts)
+	}
+	if persisted[0].Author != "user" {
+		t.Errorf("persisted Author = %q, want %q", persisted[0].Author, "user")
+	}
+	if persisted[0].Content.Role != "user" {
+		t.Errorf("persisted Role = %q, want %q", persisted[0].Content.Role, "user")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 28: No-op when input buffer empty
+// ---------------------------------------------------------------------------
+
+func TestScenario28_EmptyInputBufferNoop(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{
+		transcriptResponse("Hi!", "output", true),
+		turnCompleteResponse(),
+	}
+
+	r, svc, _ := setupRunner(t, conn, nil, nil)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	events, errs := collectEvents(t, r, queue)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 yielded events, got %d", len(events))
+	}
+
+	persisted := svc.PersistedEvents()
+	texts := persistedTexts(persisted)
+	if len(texts) != 1 || texts[0] != "Hi!" {
+		t.Fatalf("expected [Hi!], got %v", texts)
+	}
+	if len(persisted) != 1 {
+		t.Fatalf("expected 1 persisted event, got %d", len(persisted))
+	}
+	if persisted[0].Author == "user" {
+		t.Error("persisted event should not have Author=user (no input transcript)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 29: Multi-turn interleaving
+// ---------------------------------------------------------------------------
+
+func TestScenario29_MultiTurnInterleaving(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{
+		transcriptResponse("Hello", "input", false),
+		transcriptResponse("Hi!", "output", true),
+		functionCallResponse("fc1", "lookup", map[string]any{}),
+		transcriptResponse("Found it", "output", true),
+		transcriptResponse("Thanks", "input", false),
+		transcriptResponse("You're welcome", "output", true),
+		turnCompleteResponse(),
+	}
+
+	lookupTool := &mockTool{
+		name:   "lookup",
+		result: map[string]any{"result": "ok"},
+	}
+
+	r, svc, _ := setupRunner(t, conn, []tool.Tool{lookupTool}, nil)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	_, errs := collectEvents(t, r, queue)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	persisted := svc.PersistedEvents()
+
+	// Classify each persisted event by type and record its index.
+	type classified struct {
+		idx  int
+		kind string // "user", "model", "fc", "fr"
+		text string
+	}
+	var classes []classified
+	for i, ev := range persisted {
+		if ev.Content == nil {
+			continue
+		}
+		for _, p := range ev.Content.Parts {
+			switch {
+			case p.FunctionCall != nil:
+				classes = append(classes, classified{i, "fc", ""})
+			case p.FunctionResponse != nil:
+				classes = append(classes, classified{i, "fr", ""})
+			case p.Text != "" && ev.Author == "user":
+				classes = append(classes, classified{i, "user", p.Text})
+			case p.Text != "":
+				classes = append(classes, classified{i, "model", p.Text})
+			}
+		}
+	}
+
+	// Helper to find index of first match.
+	findIdx := func(kind, text string) int {
+		for _, c := range classes {
+			if c.kind == kind && (text == "" || c.text == text) {
+				return c.idx
+			}
+		}
+		return -1
+	}
+
+	helloIdx := findIdx("user", "Hello")
+	hiIdx := findIdx("model", "Hi!")
+	fcIdx := findIdx("fc", "")
+	frIdx := findIdx("fr", "")
+	foundIdx := findIdx("model", "Found it")
+	thanksIdx := findIdx("user", "Thanks")
+	welcomeIdx := findIdx("model", "You're welcome")
+
+	// Assert all events found.
+	for _, pair := range []struct {
+		name string
+		idx  int
+	}{
+		{"Hello", helloIdx}, {"Hi!", hiIdx}, {"fc", fcIdx}, {"fr", frIdx},
+		{"Found it", foundIdx}, {"Thanks", thanksIdx}, {"You're welcome", welcomeIdx},
+	} {
+		if pair.idx < 0 {
+			t.Fatalf("missing %q in persisted events", pair.name)
+		}
+	}
+
+	// Assert chronological ordering.
+	if helloIdx >= hiIdx {
+		t.Errorf("Hello (idx %d) should come before Hi! (idx %d)", helloIdx, hiIdx)
+	}
+	if hiIdx >= fcIdx {
+		t.Errorf("Hi! (idx %d) should come before function call (idx %d)", hiIdx, fcIdx)
+	}
+	if fcIdx >= frIdx {
+		t.Errorf("function call (idx %d) should come before tool response (idx %d)", fcIdx, frIdx)
+	}
+	if frIdx >= foundIdx {
+		t.Errorf("tool response (idx %d) should come before Found it (idx %d)", frIdx, foundIdx)
+	}
+	if thanksIdx >= welcomeIdx {
+		t.Errorf("Thanks (idx %d) should come before You're welcome (idx %d)", thanksIdx, welcomeIdx)
+	}
+
+	// persistedTexts should skip function call/response (no .Text).
+	texts := persistedTexts(persisted)
+	expected := []string{"Hello", "Hi!", "Found it", "Thanks", "You're welcome"}
+	if len(texts) != len(expected) {
+		t.Fatalf("persistedTexts = %v, want %v", texts, expected)
+	}
+	for i, want := range expected {
+		if texts[i] != want {
+			t.Errorf("persistedTexts[%d] = %q, want %q", i, texts[i], want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 30: InputTranscription flushed before plain-text Content (no OutputTranscription)
+// ---------------------------------------------------------------------------
+
+func TestScenario30_InputFlushedBeforeTextContent(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{
+		transcriptResponse("Hello", "input", false),
+		textResponse("Hi there"),
+		turnCompleteResponse(),
+	}
+
+	r, svc, _ := setupRunner(t, conn, nil, nil)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	events, errs := collectEvents(t, r, queue)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(events) != 3 {
+		t.Fatalf("expected 3 yielded events, got %d", len(events))
+	}
+
+	persisted := svc.PersistedEvents()
+	texts := persistedTexts(persisted)
+	if len(texts) != 2 || texts[0] != "Hello" || texts[1] != "Hi there" {
+		t.Fatalf("expected [Hello, Hi there], got %v", texts)
+	}
+
+	if persisted[0].Author != "user" {
+		t.Errorf("first persisted Author = %q, want %q", persisted[0].Author, "user")
+	}
+	if persisted[0].Content.Role != "user" {
+		t.Errorf("first persisted Role = %q, want %q", persisted[0].Content.Role, "user")
+	}
+	if persisted[1].Author == "user" {
+		t.Error("second persisted event should not have Author=user")
+	}
+}
