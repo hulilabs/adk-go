@@ -46,10 +46,13 @@ func (c *geminiLiveConnection) Send(_ context.Context, req *model.LiveRequest) e
 		})
 	case req.RealtimeInput != nil:
 		return c.session.SendRealtimeInput(genai.LiveRealtimeInput{
-			Media: req.RealtimeInput.Media,
-			Audio: req.RealtimeInput.Audio,
-			Video: req.RealtimeInput.Video,
-			Text:  req.RealtimeInput.Text,
+			Media:          req.RealtimeInput.Media,
+			Audio:          req.RealtimeInput.Audio,
+			Video:          req.RealtimeInput.Video,
+			Text:           req.RealtimeInput.Text,
+			ActivityStart:  req.RealtimeInput.ActivityStart,
+			ActivityEnd:    req.RealtimeInput.ActivityEnd,
+			AudioStreamEnd: req.RealtimeInput.AudioStreamEnd,
 		})
 	case req.Content != nil:
 		tc := true // default: model responds after this content
