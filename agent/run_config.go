@@ -48,6 +48,9 @@ type RunConfig struct {
 	OutputAudioTranscription bool
 	ToolCoalesceWindow       time.Duration // default 150ms if zero
 	LiveBufferSize           int           // default 100 if zero
+	// TaskCompletionDelay is the time to wait after a task_completed tool
+	// response before shutting down the live session. Default 1s if zero.
+	TaskCompletionDelay time.Duration
 	// Generation parameters — applied to the live session config when set.
 	ThinkingConfig  *genai.ThinkingConfig
 	Temperature     *float32

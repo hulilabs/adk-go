@@ -270,7 +270,7 @@ func (lf *LiveFlow) receiverLoop(
 				return
 			}
 		case <-cs.flushCh:
-			lf.flushToolCalls(ctx, invCtx, conn, cs, toolsFuncMap, eventCh)
+			lf.flushToolCalls(ctx, invCtx, conn, queue, cs, toolsFuncMap, eventCh)
 		case <-ctx.Done():
 			return
 		}
@@ -328,7 +328,7 @@ func (lf *LiveFlow) processMessage(
 		return
 	}
 
-	lf.flushCoalesceBuffer(ctx, invCtx, conn, cs, toolsFuncMap, eventCh)
+	lf.flushCoalesceBuffer(ctx, invCtx, conn, queue, cs, toolsFuncMap, eventCh)
 
 	isAudio := false
 	if resp.CustomMetadata != nil {
@@ -420,6 +420,7 @@ func (lf *LiveFlow) flushCoalesceBuffer(
 	ctx context.Context,
 	invCtx agent.InvocationContext,
 	conn model.LiveConnection,
+	queue *agent.LiveRequestQueue,
 	cs *coalesceState,
 	toolsFuncMap map[string]toolinternal.FunctionTool,
 	eventCh chan<- eventOrError,
@@ -440,13 +441,14 @@ func (lf *LiveFlow) flushCoalesceBuffer(
 	if empty {
 		return
 	}
-	lf.flushToolCalls(ctx, invCtx, conn, cs, toolsFuncMap, eventCh)
+	lf.flushToolCalls(ctx, invCtx, conn, queue, cs, toolsFuncMap, eventCh)
 }
 
 func (lf *LiveFlow) flushToolCalls(
 	ctx context.Context,
 	invCtx agent.InvocationContext,
 	conn model.LiveConnection,
+	queue *agent.LiveRequestQueue,
 	cs *coalesceState,
 	toolsFuncMap map[string]toolinternal.FunctionTool,
 	eventCh chan<- eventOrError,
@@ -469,6 +471,22 @@ func (lf *LiveFlow) flushToolCalls(
 		return
 	}
 	lf.emitFunctionResponseEvent(ctx, invCtx, responses, eventCh)
+
+	// Check if any tool response signals task completion.
+	for _, r := range responses {
+		if r.Name == "task_completed" {
+			delay := time.Second
+			if rc := invCtx.RunConfig(); rc != nil && rc.TaskCompletionDelay > 0 {
+				delay = rc.TaskCompletionDelay
+			}
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+			}
+			queue.Close()
+			return
+		}
+	}
 }
 
 func (lf *LiveFlow) collectBufferedCalls(cs *coalesceState) map[string]*genai.FunctionCall {
