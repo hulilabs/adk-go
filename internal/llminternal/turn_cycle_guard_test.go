@@ -95,6 +95,36 @@ func TestTurnCycleGuard(t *testing.T) {
 				}
 			},
 		},
+		{
+			// Once armed, redundant onTurnComplete calls must not flip back to
+			// disarmed nor double-arm in a way that breaks subsequent
+			// suppression. The model occasionally re-emits TurnComplete on
+			// the same logical turn — those should be no-ops.
+			name: "TurnComplete is idempotent when already armed",
+			run: func(t *testing.T, g *turnCycleGuard) {
+				g.onModelContent()
+				g.onTurnComplete() // arms
+				g.onTurnComplete() // redundant — must remain armed
+				if !g.onModelContent() {
+					t.Error("expected suppression to persist after redundant onTurnComplete")
+				}
+			},
+		},
+		{
+			// reset() must clear BOTH contentDelivered and suppressActive.
+			// Guards a regression where someone "optimizes" reset to only
+			// touch suppressActive: a subsequent onTurnComplete would
+			// incorrectly arm because the stale contentDelivered persists.
+			name: "reset clears contentDelivered, not just suppressActive",
+			run: func(t *testing.T, g *turnCycleGuard) {
+				g.onModelContent() // contentDelivered = true
+				g.reset()          // must clear both
+				g.onTurnComplete() // post-reset: contentDelivered=false, must NOT arm
+				if g.onModelContent() {
+					t.Error("reset must clear contentDelivered; otherwise onTurnComplete after reset incorrectly arms")
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {

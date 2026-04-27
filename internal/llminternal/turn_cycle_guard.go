@@ -56,8 +56,13 @@ func applyTurnCycleGuard(resp *model.LLMResponse, guard *turnCycleGuard, isAudio
 		suppressModelContent = guard.onModelContent()
 	}
 
-	// Track TurnComplete in guard regardless of suppress decision.
-	if resp.TurnComplete || resp.Interrupted {
+	// Interruption clears all turn-cycle state — a new turn begins from a
+	// clean slate per issue #15. Conflating it with TurnComplete falsely
+	// arms suppression against the next legitimate model response.
+	// TurnComplete continues to arm conditionally on contentDelivered.
+	if resp.Interrupted {
+		guard.reset()
+	} else if resp.TurnComplete {
 		guard.onTurnComplete()
 	}
 

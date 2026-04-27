@@ -18,6 +18,7 @@ import (
 	"context"
 	"io"
 	"iter"
+	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -1682,14 +1683,20 @@ func TestScenario23_MixedMessageContentSuppressedTranscriptionEmitted(t *testing
 // Scenario 24: Post-Interrupted known limitation — out of scope for #34
 // ---------------------------------------------------------------------------
 
-func TestScenario24_PostInterruptedKnownLimitation(t *testing.T) {
-	// Documents known false positive — out of scope for issue #34.
-	// If the model is Interrupted and immediately sends new content
-	// before turnResetCh fires, the guard may suppress it.
+func TestScenario24_InterruptionResetsGuard(t *testing.T) {
+	// Issue #15 contract: Interruption clears all turn-cycle state. After
+	// content + TurnComplete arms suppression, an Interrupted message must
+	// reset the guard so the next legitimate model response flows through.
+	//
+	// Sequence:
+	//   1. "A" + TurnComplete → guard armed (PR-33's existing behavior).
+	//   2. Interrupted (no content) → guard reset (this fix).
+	//   3. "B" + TurnComplete → must NOT be suppressed.
 	conn := newMockLiveConnection()
 	conn.recvResponses = []*model.LLMResponse{
 		textResponseWithTurnComplete("A"),
-		textResponseInterrupted("B"),
+		{Interrupted: true},
+		textResponseWithTurnComplete("B"),
 	}
 
 	r, _, _ := setupRunner(t, conn, nil, nil)
@@ -1698,13 +1705,14 @@ func TestScenario24_PostInterruptedKnownLimitation(t *testing.T) {
 
 	events, _ := collectEvents(t, r, queue)
 
-	// "A" is emitted. "B" is suppressed (known false positive).
 	texts := modelContentTexts(events)
-	if len(texts) != 1 || texts[0] != "A" {
-		t.Errorf("expected only [A] emitted (B suppressed as known limitation), got %v", texts)
+	want := []string{"A", "B"}
+	if !reflect.DeepEqual(texts, want) {
+		t.Fatalf("texts = %v, want %v (Interrupted should have reset the guard)", texts, want)
 	}
 
-	// SetModelSpeaking(false) must still fire for Interrupted.
+	// SetModelSpeaking(false) side-effect must still fire for Interrupted —
+	// this is independent of the guard reset and shared with TurnComplete.
 	if queue.ModelSpeaking() {
 		t.Error("ModelSpeaking should be false: Interrupted must call SetModelSpeaking(false)")
 	}
