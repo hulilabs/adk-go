@@ -1278,9 +1278,16 @@ func TestScenario16_GoAwayReconnectionWithHandle(t *testing.T) {
 	})
 
 	svc := &mockSessionService{Service: session.InMemoryService()}
-	_, _ = svc.Service.Create(context.Background(), &session.CreateRequest{
+	createResp, _ := svc.Service.Create(context.Background(), &session.CreateRequest{
 		AppName: "test", UserID: "user1", SessionID: "sess1",
 	})
+
+	// Append a prior event so the resume-vs-fresh history assertion is
+	// meaningful — without prior turns, sendHistory has nothing to send
+	// regardless of handle state and the assertion would be vacuous.
+	if err := svc.Service.AppendEvent(context.Background(), createResp.Session, priorUserEvent("hello")); err != nil {
+		t.Fatal(err)
+	}
 
 	r, _ := New(Config{
 		AppName:        "test",
@@ -1290,22 +1297,28 @@ func TestScenario16_GoAwayReconnectionWithHandle(t *testing.T) {
 
 	queue := agent.NewLiveRequestQueue(100)
 
+	// Pre-load conn1 messages. The buffered recvCh and the size-1 worker
+	// channel inside startReceiveWorker together guarantee the runner
+	// processes the resumption update before the GoAway, with no need
+	// for a wall-clock pause between sends.
+	conn1.recvCh <- &model.LLMResponse{
+		SessionResumptionUpdate: &genai.LiveServerSessionResumptionUpdate{
+			NewHandle: "test-handle-123",
+			Resumable: true,
+		},
+	}
+	conn1.recvCh <- &model.LLMResponse{
+		GoAway:         &genai.LiveServerGoAway{},
+		CustomMetadata: map[string]any{"go_away": true},
+	}
+
+	// Close the queue once the reconnect has been recorded so conn2 can
+	// finish. waitForCond is non-fatal: a t.Fatalf in a goroutine would
+	// only exit that goroutine and leave the queue open, hanging the test.
+	closerDone := make(chan struct{})
 	go func() {
-		// Send a session resumption update with a handle.
-		conn1.recvCh <- &model.LLMResponse{
-			SessionResumptionUpdate: &genai.LiveServerSessionResumptionUpdate{
-				NewHandle: "test-handle-123",
-				Resumable: true,
-			},
-		}
-		// Brief pause then send GoAway to trigger reconnection.
-		time.Sleep(50 * time.Millisecond)
-		conn1.recvCh <- &model.LLMResponse{
-			GoAway:         &genai.LiveServerGoAway{},
-			CustomMetadata: map[string]any{"go_away": true},
-		}
-		// Close the queue after reconnection so the second session can exit.
-		time.Sleep(time.Second)
+		defer close(closerDone)
+		waitForCond(5*time.Second, func() bool { return len(llm.Handles()) >= 2 })
 		queue.Close()
 	}()
 
@@ -1320,6 +1333,7 @@ func TestScenario16_GoAwayReconnectionWithHandle(t *testing.T) {
 			events = append(events, ev)
 		}
 	}
+	<-closerDone
 
 	// Verify ConnectLive was called at least twice (initial + reconnect).
 	handles := llm.Handles()
@@ -1340,6 +1354,15 @@ func TestScenario16_GoAwayReconnectionWithHandle(t *testing.T) {
 	// First connection should be closed (GoAway terminated it).
 	if !conn1.WasClosed() {
 		t.Error("expected first connection to be closed after GoAway")
+	}
+
+	// Initial fresh connect must replay history; resumed connect must not
+	// (the server already has the conversation up to the saved handle).
+	if !hasContentSend(conn1.SendLog()) {
+		t.Error(`conn1 (initial fresh connect, handle="") should have history replay`)
+	}
+	if hasContentSend(conn2.SendLog()) {
+		t.Error(`conn2 (resumed with handle="test-handle-123") should NOT have history replay`)
 	}
 }
 
@@ -1373,9 +1396,16 @@ func TestScenario17_NonResumableClearsHandle(t *testing.T) {
 	})
 
 	svc := &mockSessionService{Service: session.InMemoryService()}
-	_, _ = svc.Service.Create(context.Background(), &session.CreateRequest{
+	createResp, _ := svc.Service.Create(context.Background(), &session.CreateRequest{
 		AppName: "test", UserID: "user1", SessionID: "sess1",
 	})
+
+	// Append a prior event so the resume-vs-fresh history assertions below
+	// are meaningful — without prior turns, sendHistory has nothing to
+	// send regardless of handle state.
+	if err := svc.Service.AppendEvent(context.Background(), createResp.Session, priorUserEvent("hello")); err != nil {
+		t.Fatal(err)
+	}
 
 	r, _ := New(Config{
 		AppName:        "test",
@@ -1385,35 +1415,33 @@ func TestScenario17_NonResumableClearsHandle(t *testing.T) {
 
 	queue := agent.NewLiveRequestQueue(100)
 
+	// Pre-load all server-pushed messages. Buffered recvCh + the size-1
+	// channel inside startReceiveWorker enforce strict serialization, so
+	// the runner processes each update BEFORE the following GoAway with
+	// no wall-clock sleep needed between sends.
+	conn1.recvCh <- &model.LLMResponse{
+		SessionResumptionUpdate: &genai.LiveServerSessionResumptionUpdate{
+			NewHandle: "old-handle",
+			Resumable: true,
+		},
+	}
+	conn1.recvCh <- &model.LLMResponse{GoAway: &genai.LiveServerGoAway{}}
+
+	conn2.recvCh <- &model.LLMResponse{
+		SessionResumptionUpdate: &genai.LiveServerSessionResumptionUpdate{
+			Resumable: false,
+		},
+	}
+	conn2.recvCh <- &model.LLMResponse{GoAway: &genai.LiveServerGoAway{}}
+
+	// Closer goroutine: closes the queue once the third connect is
+	// recorded so conn3 can exit. Uses a non-fatal poll helper because
+	// t.Fatalf in a goroutine only exits that goroutine — it would leave
+	// the queue open and hang the main RunLive iteration.
+	closerDone := make(chan struct{})
 	go func() {
-		// Phase 1 (conn1): server sets a handle, then issues GoAway.
-		conn1.recvCh <- &model.LLMResponse{
-			SessionResumptionUpdate: &genai.LiveServerSessionResumptionUpdate{
-				NewHandle: "old-handle",
-				Resumable: true,
-			},
-		}
-		// Give the runner time to absorb the update before the GoAway,
-		// so the handle is durably set on ctx before reconnection.
-		time.Sleep(20 * time.Millisecond)
-		conn1.recvCh <- &model.LLMResponse{GoAway: &genai.LiveServerGoAway{}}
-
-		// Wait for reconnect to happen so handles[1] is recorded.
-		waitFor(t, 2*time.Second, func() bool { return len(llm.Handles()) >= 2 })
-
-		// Phase 2 (conn2): server marks non-resumable (clears the handle),
-		// then issues GoAway to force another reconnect.
-		conn2.recvCh <- &model.LLMResponse{
-			SessionResumptionUpdate: &genai.LiveServerSessionResumptionUpdate{
-				Resumable: false,
-			},
-		}
-		time.Sleep(20 * time.Millisecond)
-		conn2.recvCh <- &model.LLMResponse{GoAway: &genai.LiveServerGoAway{}}
-
-		// Wait for the third reconnect (handles[2]) before closing the queue.
-		waitFor(t, 2*time.Second, func() bool { return len(llm.Handles()) >= 3 })
-
+		defer close(closerDone)
+		waitForCond(5*time.Second, func() bool { return len(llm.Handles()) >= 3 })
 		queue.Close()
 	}()
 
@@ -1423,6 +1451,7 @@ func TestScenario17_NonResumableClearsHandle(t *testing.T) {
 		_ = ev
 		_ = err
 	}
+	<-closerDone
 
 	handles := llm.Handles()
 	if len(handles) != 3 {
@@ -1440,19 +1469,53 @@ func TestScenario17_NonResumableClearsHandle(t *testing.T) {
 	if !conn1.WasClosed() || !conn2.WasClosed() {
 		t.Error("expected both reconnected connections to be closed after GoAway")
 	}
+
+	// History assertions: replay only happens when the local handle is empty
+	// (i.e., the server is not already replaying for us). The middle conn
+	// is a resume; the bookend conns are fresh.
+	if !hasContentSend(conn1.SendLog()) {
+		t.Error(`conn1 (initial fresh connect, handle="") should have history replay`)
+	}
+	if hasContentSend(conn2.SendLog()) {
+		t.Error(`conn2 (resumed with handle="old-handle") should NOT have history replay`)
+	}
+	if !hasContentSend(conn3.SendLog()) {
+		t.Error(`conn3 (fresh after non-resumable clear, handle="") should have history replay`)
+	}
 }
 
-// waitFor polls cond until it returns true or the deadline expires. Used by
-// reconnect-tests where the synchronization point is the runner's progress
-// (e.g., handle count) rather than a wall-clock duration.
-func waitFor(t *testing.T, d time.Duration, cond func() bool) {
-	t.Helper()
+// waitForCond polls cond until it returns true or the deadline expires.
+// Returns true on success, false on timeout. Safe to call from goroutines
+// because it does not invoke t.Fatalf — the caller decides how to react.
+// (A t.Fatalf in a non-test goroutine only exits that goroutine and would
+// leave a test-managed resource like a queue open, hanging the main test.)
+func waitForCond(d time.Duration, cond func() bool) bool {
 	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
 		if cond() {
-			return
+			return true
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("waitFor: condition not met within %s", d)
+	return false
+}
+
+// priorUserEvent builds a session.Event with user-role text content suitable
+// for AppendEvent, so sendHistory has a non-empty turn to replay.
+func priorUserEvent(text string) *session.Event {
+	ev := session.NewEvent("prior")
+	ev.Author = "user"
+	ev.LLMResponse.Content = genai.NewContentFromText(text, "user")
+	return ev
+}
+
+// hasContentSend reports whether log contains a LiveRequest carrying a
+// non-nil Content payload — i.e., a history-replay turn.
+func hasContentSend(log []*model.LiveRequest) bool {
+	for _, req := range log {
+		if req.Content != nil {
+			return true
+		}
+	}
+	return false
 }
