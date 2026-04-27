@@ -1719,6 +1719,62 @@ func TestScenario24_InterruptionResetsGuard(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Scenario 25: Audio messages bypass the guard
+// ---------------------------------------------------------------------------
+
+func TestScenario25_AudioBypassesGuard(t *testing.T) {
+	// Audio messages must NOT be subject to suppression even when the
+	// guard is armed — the guard's contract is about *text* content
+	// duplicates across turn boundaries; audio (and especially audio
+	// pacing during a single turn) is independent. applyTurnCycleGuard's
+	// isAudio parameter exists exactly for this carve-out, but no
+	// scenario isolated it; an audio-only stream after TurnComplete
+	// would silently regress without this test.
+	//
+	// Sequence:
+	//   1. Text content + TurnComplete -> arms the guard.
+	//   2. Audio response arrives while the guard is armed.
+	//      isAudio=true means applyTurnCycleGuard's check
+	//      `isModelContent := ... && !isAudio` short-circuits, so
+	//      onModelContent is never consulted -> audio passes through.
+	conn := newMockLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{
+		textResponseWithTurnComplete("hello"),
+		audioResponse([]byte{0xCA, 0xFE}),
+	}
+
+	r, _, _ := setupRunner(t, conn, nil, nil)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	events, _ := collectEvents(t, r, queue)
+
+	// "hello" should be emitted; audio response should also be emitted
+	// (not nil-dropped by the guard).
+	texts := modelContentTexts(events)
+	if len(texts) != 1 || texts[0] != "hello" {
+		t.Errorf("text content texts = %v, want [hello]", texts)
+	}
+
+	// Audio event present? Look for is_audio CustomMetadata on emitted
+	// events — that's the marker the guard would have to recognize to
+	// route audio around suppression.
+	audioEmitted := false
+	for _, ev := range events {
+		if ev.CustomMetadata == nil {
+			continue
+		}
+		if v, ok := ev.CustomMetadata["is_audio"].(bool); ok && v {
+			audioEmitted = true
+			break
+		}
+	}
+	if !audioEmitted {
+		t.Error("expected audio event to be emitted (audio must bypass the guard even when armed)")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Scenario 26: Function-response boundary resets the guard
 // ---------------------------------------------------------------------------
 
