@@ -376,6 +376,12 @@ func (lf *LiveFlow) receiverLoop(
 			}
 		case <-cs.flushCh:
 			lf.flushToolCalls(ctx, invCtx, conn, cs, toolsFuncMap, ts, queue, eventCh)
+			// Function-response boundary begins a new conversational
+			// context per issue #15 — clear any armed suppression so the
+			// next model content (the response synthesized from the tool
+			// result) flows through. Must run AFTER flushToolCalls returns
+			// so the reset doesn't race with concurrent buffer iteration.
+			guard.reset()
 		case <-turnResetCh:
 			guard.reset()
 		case <-ctx.Done():

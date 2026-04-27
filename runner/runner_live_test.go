@@ -1717,3 +1717,93 @@ func TestScenario24_InterruptionResetsGuard(t *testing.T) {
 		t.Error("ModelSpeaking should be false: Interrupted must call SetModelSpeaking(false)")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 26: Function-response boundary resets the guard
+// ---------------------------------------------------------------------------
+
+func TestScenario26_FunctionResponseResetsGuard(t *testing.T) {
+	// Issue #15 lists "function response" as a reset trigger. After the
+	// agent sends a FunctionResponse, the guard must be reset so the
+	// model's synthesized response (the new conversational context that
+	// follows the tool result) is not suppressed.
+	//
+	// Sequence:
+	//   1. Model emits "thinking" + TurnComplete   -> arms guard
+	//   2. Model emits FunctionCall                -> resets (existing path)
+	//   3. Tool executes, agent sends FunctionResponse via flushToolCalls
+	//      -> Fix 2 also resets in the flushCh select case
+	//   4. Model emits "final answer" + TurnComplete
+	//      -> MUST NOT be suppressed
+	//
+	// Note: step 2's existing reset already clears the guard, so removing
+	// Fix 2 in isolation does not flip this assertion. The test pins the
+	// end-to-end contract from issue #15: post-FunctionResponse content
+	// flows through, regardless of which reset path applies. The unit-
+	// level test for Fix 2 is the receiverLoop's flushCh case calling
+	// guard.reset() — verified by inspection and by Scenario 21's
+	// orphan-suppression continuing to behave correctly.
+	conn := newMockLiveConnection()
+	conn.recvCh = make(chan *model.LLMResponse, 20)
+
+	fastTool := &mockTool{
+		name:   "answer_tool",
+		result: map[string]any{"answer": "42"},
+	}
+
+	llm := &mockLiveLLM{conn: conn}
+	a, _ := llmagent.New(llmagent.Config{
+		Name:  "test_agent",
+		Model: llm,
+		Tools: []tool.Tool{fastTool},
+	})
+
+	svc := &mockSessionService{Service: session.InMemoryService()}
+	_, _ = svc.Service.Create(context.Background(), &session.CreateRequest{
+		AppName: "test", UserID: "user1", SessionID: "sess1",
+	})
+
+	r, _ := New(Config{
+		AppName:        "test",
+		Agent:          a,
+		SessionService: svc,
+	})
+
+	queue := agent.NewLiveRequestQueue(100)
+
+	go func() {
+		// Step 1: pre-tool content + TurnComplete arms the guard.
+		conn.recvCh <- textResponseWithTurnComplete("thinking")
+		// Step 2: FunctionCall resets the guard, buffers the call.
+		conn.recvCh <- functionCallResponse("fc1", "answer_tool", nil)
+		// Step 3: give the tool time to run and the FunctionResponse to
+		// be sent (Fix 2 reset fires after flushToolCalls returns).
+		time.Sleep(100 * time.Millisecond)
+		// Step 4: post-tool content must NOT be suppressed.
+		conn.recvCh <- textResponseWithTurnComplete("final answer")
+		time.Sleep(100 * time.Millisecond)
+		close(conn.recvCh)
+		queue.Close()
+	}()
+
+	cfg := agent.RunConfig{ToolCoalesceWindow: 10 * time.Millisecond}
+	var events []*session.Event
+	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+		if err != nil {
+			break
+		}
+		if ev != nil {
+			events = append(events, ev)
+		}
+	}
+
+	if fastTool.CallCount() != 1 {
+		t.Errorf("expected answer_tool called once, got %d", fastTool.CallCount())
+	}
+
+	texts := modelContentTexts(events)
+	want := []string{"thinking", "final answer"}
+	if !reflect.DeepEqual(texts, want) {
+		t.Errorf("texts = %v, want %v (post-FunctionResponse content must not be suppressed)", texts, want)
+	}
+}
