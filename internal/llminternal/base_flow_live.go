@@ -64,33 +64,6 @@ type recvResult struct {
 	err  error
 }
 
-// turnCycleGuard tracks turn-cycle boundaries within receiverLoop to
-// suppress duplicate model content caused by orphaned tool results.
-// NOT goroutine-safe — only accessed from the receiverLoop goroutine.
-type turnCycleGuard struct {
-	contentDelivered bool // model content emitted since last reset
-	suppressActive   bool // suppress subsequent model content
-}
-
-func (g *turnCycleGuard) onModelContent() bool {
-	if g.suppressActive {
-		return true // suppress
-	}
-	g.contentDelivered = true
-	return false
-}
-
-func (g *turnCycleGuard) onTurnComplete() {
-	if g.contentDelivered {
-		g.suppressActive = true
-	}
-}
-
-func (g *turnCycleGuard) reset() {
-	g.contentDelivered = false
-	g.suppressActive = false
-}
-
 type liveTimingState struct {
 	mu            sync.Mutex
 	lastEventTime time.Time
@@ -508,38 +481,6 @@ func (lf *LiveFlow) processMessage(
 	ev.LiveDiagnostics = diag
 
 	sendEvent(ctx, eventCh, eventOrError{event: ev})
-}
-
-// applyTurnCycleGuard evaluates the guard for the given response.
-// Returns nil if the message should be fully suppressed.
-// Returns a (possibly modified) response otherwise.
-func applyTurnCycleGuard(resp *model.LLMResponse, guard *turnCycleGuard, isAudio bool) *model.LLMResponse {
-	isModelContent := resp.Content != nil && resp.Content.Role == "model" && !isAudio
-	hasTranscription := resp.InputTranscription != nil || resp.OutputTranscription != nil
-
-	// Check guard INDEPENDENTLY of transcription.
-	suppressModelContent := false
-	if isModelContent {
-		suppressModelContent = guard.onModelContent()
-	}
-
-	// Track TurnComplete in guard regardless of suppress decision.
-	if resp.TurnComplete || resp.Interrupted {
-		guard.onTurnComplete()
-	}
-
-	if !suppressModelContent {
-		return resp
-	}
-
-	if !hasTranscription {
-		return nil // pure model content, fully suppressed
-	}
-
-	// Mixed message: strip model content, keep transcription.
-	stripped := *resp
-	stripped.Content = nil
-	return &stripped
 }
 
 // populateProtocolState extracts protocol state from CustomMetadata into LiveDiagnostics.
