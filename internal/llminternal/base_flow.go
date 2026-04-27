@@ -486,7 +486,7 @@ func (f *Flow) agentToRun(ctx agent.InvocationContext, agentName string) agent.A
 	// tree from the root_agent when processing _postprocess_handle_function_calls_async.
 	// I think that is strange. In our version, we check the agents included in transferTarget.
 	parents := parentmap.FromContext(ctx)
-	agents := transferTargets(ctx.Agent(), parents[ctx.Agent().Name()])
+	agents := TransferTargets(ctx.Agent(), parents[ctx.Agent().Name()])
 	for _, agent := range agents {
 		if agent.Name() == agentName {
 			return agent

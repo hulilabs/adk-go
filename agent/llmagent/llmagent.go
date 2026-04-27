@@ -24,6 +24,7 @@ import (
 
 	"google.golang.org/adk/agent"
 	agentinternal "google.golang.org/adk/internal/agent"
+	"google.golang.org/adk/internal/agent/parentmap"
 	icontext "google.golang.org/adk/internal/context"
 	"google.golang.org/adk/internal/llminternal"
 	"google.golang.org/adk/model"
@@ -452,6 +453,39 @@ func (a *llmAgent) runLive(ctx agent.InvocationContext) iter.Seq2[*session.Event
 	}
 	req.LiveConfig.Tools = buildLiveTools(a.Tools)
 
+	// If this agent participates in auto-flow (has sub-agents or allows
+	// transfers), inject the transfer_to_agent tool and instructions into
+	// the live config so the model can trigger agent transfers.
+	if llminternal.ShouldUseAutoFlow(a) {
+		parents := parentmap.FromContext(ctx)
+		targets := llminternal.TransferTargets(a, parents[a.Name()])
+		if len(targets) > 0 {
+			transferTool := &llminternal.TransferToAgentTool{}
+			si, siErr := llminternal.InstructionsForTransferToAgent(a, parents[a.Name()], targets, transferTool)
+			if siErr != nil {
+				return llminternal.ErrIter(fmt.Errorf("failed to build transfer instructions: %w", siErr))
+			}
+			// Prepend transfer instructions to the system instruction.
+			existing := ""
+			if req.LiveConfig.SystemInstruction != nil && len(req.LiveConfig.SystemInstruction.Parts) > 0 {
+				existing = req.LiveConfig.SystemInstruction.Parts[0].Text
+			}
+			combined := si + "\n" + existing
+			req.LiveConfig.SystemInstruction = &genai.Content{
+				Parts: []*genai.Part{{Text: strings.TrimSpace(combined)}},
+			}
+			// Append the transfer tool declaration.
+			decl := transferTool.Declaration()
+			if decl != nil {
+				if len(req.LiveConfig.Tools) == 0 {
+					req.LiveConfig.Tools = []*genai.Tool{{FunctionDeclarations: []*genai.FunctionDeclaration{decl}}}
+				} else {
+					req.LiveConfig.Tools[0].FunctionDeclarations = append(req.LiveConfig.Tools[0].FunctionDeclarations, decl)
+				}
+			}
+		}
+	}
+
 	conn, err := liveLLM.ConnectLive(ctx, req)
 	if err != nil {
 		return llminternal.ErrIter(fmt.Errorf("failed to connect live: %w", err))
@@ -465,9 +499,14 @@ func (a *llmAgent) runLive(ctx agent.InvocationContext) iter.Seq2[*session.Event
 		coalesceWindow = 150 * time.Millisecond
 	}
 
+	liveTools := a.Tools
+	if llminternal.ShouldUseAutoFlow(a) {
+		liveTools = append(append([]tool.Tool{}, a.Tools...), &llminternal.TransferToAgentTool{})
+	}
+
 	lf := &llminternal.LiveFlow{
 		Model:                a.model,
-		Tools:                a.Tools,
+		Tools:                liveTools,
 		BeforeToolCallbacks:  a.beforeToolCallbacks,
 		AfterToolCallbacks:   a.afterToolCallbacks,
 		OnToolErrorCallbacks: a.onToolErrorCallbacks,

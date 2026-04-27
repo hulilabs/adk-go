@@ -69,13 +69,13 @@ func AgentTransferRequestProcessor(ctx agent.InvocationContext, req *model.LLMRe
 	return func(yield func(*session.Event, error) bool) {
 		// TODO: support agent types other than LLMAgent, that have parent/subagents?
 		agent := ctx.Agent()
-		if !shouldUseAutoFlow(agent) {
+		if !ShouldUseAutoFlow(agent) {
 			return
 		}
 
 		parents := parentmap.FromContext(ctx)
 
-		targets := transferTargets(agent, parents[agent.Name()])
+		targets := TransferTargets(agent, parents[agent.Name()])
 		if len(targets) == 0 {
 			return
 		}
@@ -83,7 +83,7 @@ func AgentTransferRequestProcessor(ctx agent.InvocationContext, req *model.LLMRe
 		// TODO(hyangah): why do we set this up in request processor
 		// instead of registering this as a normal function tool of the Agent?
 		transferToAgentTool := &TransferToAgentTool{}
-		si, err := instructionsForTransferToAgent(agent, parents[agent.Name()], targets, transferToAgentTool)
+		si, err := InstructionsForTransferToAgent(agent, parents[agent.Name()], targets, transferToAgentTool)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -155,7 +155,8 @@ func (t *TransferToAgentTool) Run(ctx tool.Context, args any) (map[string]any, e
 
 var _ tool.Tool = (*TransferToAgentTool)(nil)
 
-func transferTargets(agent, parent agent.Agent) []agent.Agent {
+// TransferTargets returns the agents that the given agent can transfer to.
+func TransferTargets(agent, parent agent.Agent) []agent.Agent {
 	targets := slices.Clone(agent.SubAgents())
 
 	llmAgent := asLLMAgent(agent)
@@ -172,7 +173,7 @@ func transferTargets(agent, parent agent.Agent) []agent.Agent {
 	// - the parent agent is also of AutoFlow.
 	// - DisallowTransferToPeers is false.
 	if !llmAgent.internal().DisallowTransferToPeers {
-		if shouldUseAutoFlow(parent) {
+		if ShouldUseAutoFlow(parent) {
 			for _, peer := range parent.SubAgents() {
 				if peer.Name() != agent.Name() {
 					targets = append(targets, peer)
@@ -193,7 +194,7 @@ func asLLMAgent(agent agent.Agent) Agent {
 	return nil
 }
 
-func shouldUseAutoFlow(agent agent.Agent) bool {
+func ShouldUseAutoFlow(agent agent.Agent) bool {
 	a := asLLMAgent(agent)
 	if a == nil {
 		return false
@@ -254,7 +255,7 @@ func appendTools(r *model.LLMRequest, tools ...tool.Tool) error {
 var transferToAgentPromptTmpl = template.Must(
 	template.New("transfer_to_agent_prompt").Parse(agentTransferInstructionTemplate))
 
-func instructionsForTransferToAgent(curAgent, parent agent.Agent, targets []agent.Agent, transferTool tool.Tool) (string, error) {
+func InstructionsForTransferToAgent(curAgent, parent agent.Agent, targets []agent.Agent, transferTool tool.Tool) (string, error) {
 	if asLLMAgent(curAgent).internal().DisallowTransferToParent {
 		parent = nil
 	}
