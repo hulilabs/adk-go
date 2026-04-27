@@ -1344,11 +1344,27 @@ func TestScenario16_GoAwayReconnectionWithHandle(t *testing.T) {
 }
 
 func TestScenario17_NonResumableClearsHandle(t *testing.T) {
-	conn := newMockLiveConnection()
-	conn.recvCh = make(chan *model.LLMResponse, 10)
+	// Drive three connects to prove the full transition:
+	//   handles[0] = ""           (initial fresh connect)
+	//   handles[1] = "old-handle" (resumed with the saved handle after GoAway #1)
+	//   handles[2] = ""           (handle cleared by a non-resumable update,
+	//                              so the next reconnect must NOT carry it)
+	//
+	// Two connects only show the handle was set; the third proves it was
+	// also cleared. The third connect also exercises the deep-copy fix in
+	// withResumptionHandle: a shallow copy would leak "old-handle" into
+	// handles[2] even though our local handle was cleared.
+	conn1 := newMockLiveConnection()
+	conn1.recvCh = make(chan *model.LLMResponse, 10)
+
+	conn2 := newMockLiveConnection()
+	conn2.recvCh = make(chan *model.LLMResponse, 10)
+
+	conn3 := newMockLiveConnection()
+	conn3.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
 
 	llm := &resumptionMockLLM{
-		conns: []*mockLiveConnection{conn},
+		conns: []*mockLiveConnection{conn1, conn2, conn3},
 	}
 
 	a, _ := llmagent.New(llmagent.Config{
@@ -1370,23 +1386,34 @@ func TestScenario17_NonResumableClearsHandle(t *testing.T) {
 	queue := agent.NewLiveRequestQueue(100)
 
 	go func() {
-		// First: set a handle.
-		conn.recvCh <- &model.LLMResponse{
+		// Phase 1 (conn1): server sets a handle, then issues GoAway.
+		conn1.recvCh <- &model.LLMResponse{
 			SessionResumptionUpdate: &genai.LiveServerSessionResumptionUpdate{
 				NewHandle: "old-handle",
 				Resumable: true,
 			},
 		}
+		// Give the runner time to absorb the update before the GoAway,
+		// so the handle is durably set on ctx before reconnection.
 		time.Sleep(20 * time.Millisecond)
-		// Then: mark non-resumable (should clear the handle).
-		conn.recvCh <- &model.LLMResponse{
+		conn1.recvCh <- &model.LLMResponse{GoAway: &genai.LiveServerGoAway{}}
+
+		// Wait for reconnect to happen so handles[1] is recorded.
+		waitFor(t, 2*time.Second, func() bool { return len(llm.Handles()) >= 2 })
+
+		// Phase 2 (conn2): server marks non-resumable (clears the handle),
+		// then issues GoAway to force another reconnect.
+		conn2.recvCh <- &model.LLMResponse{
 			SessionResumptionUpdate: &genai.LiveServerSessionResumptionUpdate{
 				Resumable: false,
 			},
 		}
 		time.Sleep(20 * time.Millisecond)
-		conn.recvCh <- turnCompleteResponse()
-		time.Sleep(20 * time.Millisecond)
+		conn2.recvCh <- &model.LLMResponse{GoAway: &genai.LiveServerGoAway{}}
+
+		// Wait for the third reconnect (handles[2]) before closing the queue.
+		waitFor(t, 2*time.Second, func() bool { return len(llm.Handles()) >= 3 })
+
 		queue.Close()
 	}()
 
@@ -1397,15 +1424,35 @@ func TestScenario17_NonResumableClearsHandle(t *testing.T) {
 		_ = err
 	}
 
-	// The handle should have been cleared by the non-resumable update.
-	// We can't directly inspect the InvocationContext from here, but
-	// ConnectLive was called once with empty handle — that verifies
-	// the initial state. The clearing is tested by the fact that if a
-	// GoAway happened after the non-resumable update, the next
-	// ConnectLive would get an empty handle. This test verifies no panics
-	// and the flow completes cleanly.
 	handles := llm.Handles()
-	if len(handles) != 1 {
-		t.Fatalf("expected 1 ConnectLive call, got %d", len(handles))
+	if len(handles) != 3 {
+		t.Fatalf("expected 3 ConnectLive calls, got %d (%v)", len(handles), handles)
 	}
+	if handles[0] != "" {
+		t.Errorf("handles[0] = %q, want %q (initial fresh connect)", handles[0], "")
+	}
+	if handles[1] != "old-handle" {
+		t.Errorf("handles[1] = %q, want %q (resumed with saved handle)", handles[1], "old-handle")
+	}
+	if handles[2] != "" {
+		t.Errorf("handles[2] = %q, want %q (handle cleared by non-resumable update)", handles[2], "")
+	}
+	if !conn1.WasClosed() || !conn2.WasClosed() {
+		t.Error("expected both reconnected connections to be closed after GoAway")
+	}
+}
+
+// waitFor polls cond until it returns true or the deadline expires. Used by
+// reconnect-tests where the synchronization point is the runner's progress
+// (e.g., handle count) rather than a wall-clock duration.
+func waitFor(t *testing.T, d time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("waitFor: condition not met within %s", d)
 }
