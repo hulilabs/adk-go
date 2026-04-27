@@ -380,15 +380,6 @@ func textResponseWithTurnComplete(text string) *model.LLMResponse {
 	}
 }
 
-// textResponseInterrupted creates a single model response with content and
-// Interrupted=true. Used to test post-interruption guard behavior.
-func textResponseInterrupted(text string) *model.LLMResponse {
-	return &model.LLMResponse{
-		Content:     genai.NewContentFromText(text, "model"),
-		Interrupted: true,
-	}
-}
-
 // mixedResponse creates a model response with both model content and
 // an output transcription. Used to test mixed-message guard handling.
 func mixedResponse(text, transcriptionText string) *model.LLMResponse {
