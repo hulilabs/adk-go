@@ -114,7 +114,7 @@ func (lf *LiveFlow) RunLive(
 				return
 			}
 
-			shouldReconnect, terminated := lf.runSession(ctx, conn, queue, toolsFuncMap, yield)
+			shouldReconnect, terminated := lf.runSession(ctx, conn, queue, toolsFuncMap, handle, yield)
 			if terminated || !shouldReconnect {
 				return
 			}
@@ -178,20 +178,30 @@ func sleepOrCancel(ctx context.Context, d time.Duration) bool {
 // caller should attempt to reconnect (GoAway received) and whether the
 // iterator has been terminated by the consumer (yield returned false) or
 // by a fatal error during history replay.
+//
+// handle is the resumption handle that was passed to connectFn for this
+// session. When non-empty, the server is replaying conversation history
+// from the resumed session — re-sending it from our side would duplicate
+// turns. When empty (initial connect, or after a non-resumable update
+// cleared a stale handle), we send the local history so the model has
+// the full context.
 func (lf *LiveFlow) runSession(
 	ctx agent.InvocationContext,
 	conn model.LiveConnection,
 	queue *agent.LiveRequestQueue,
 	toolsFuncMap map[string]toolinternal.FunctionTool,
+	handle string,
 	yield func(*session.Event, error) bool,
 ) (shouldReconnect, terminated bool) {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
-	if err := lf.sendHistory(cancelCtx, ctx, conn); err != nil {
-		cancel()
-		_ = conn.Close()
-		yield(nil, fmt.Errorf("history handoff failed: %w", err))
-		return false, true
+	if handle == "" {
+		if err := lf.sendHistory(cancelCtx, ctx, conn); err != nil {
+			cancel()
+			_ = conn.Close()
+			yield(nil, fmt.Errorf("history handoff failed: %w", err))
+			return false, true
+		}
 	}
 
 	eventCh, wg := lf.startSessionLoops(cancelCtx, ctx, conn, queue, toolsFuncMap)
