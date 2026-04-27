@@ -77,7 +77,14 @@ func sendEvent(ctx context.Context, eventCh chan<- eventOrError, msg eventOrErro
 // session via the provided handle (empty string = new session).
 type ConnectFn func(handle string) (model.LiveConnection, error)
 
-const maxReconnectRetries = 3
+// Reconnect retry knobs. Declared as vars (rather than consts) so tests can
+// override them to keep wall time low and make context-cancellation timing
+// deterministic. Production behavior is unchanged.
+var (
+	maxReconnectRetries  = 3
+	reconnectBaseBackoff = time.Second
+	reconnectGoAwaySleep = 500 * time.Millisecond
+)
 
 // RunLive runs the live flow, returning an iterator of events.
 // It accepts a ConnectFn instead of a raw connection so it can reconnect
@@ -88,102 +95,187 @@ func (lf *LiveFlow) RunLive(
 	queue *agent.LiveRequestQueue,
 ) iter.Seq2[*session.Event, error] {
 	return func(yield func(*session.Event, error) bool) {
-		toolsFuncMap := make(map[string]toolinternal.FunctionTool)
-		for _, t := range lf.Tools {
-			if ft, ok := t.(toolinternal.FunctionTool); ok {
-				toolsFuncMap[t.Name()] = ft
+		toolsFuncMap := buildToolsFuncMap(lf.Tools)
+
+		// Outer loop owns the reconnect lifecycle; it terminates only via an
+		// explicit return (clean shutdown, no GoAway, fatal error, or context
+		// cancel). Each outer iteration owns a fresh inner connect-retry budget,
+		// so a successful connect cannot accidentally weaken the retry budget
+		// for the next reconnect cycle.
+		for {
+			// Capture the resumption handle once per outer iteration so the
+			// receiver-loop's mutations don't desync our gating decisions
+			// (e.g., whether to send history) from what connectFn observed.
+			handle := ctx.LiveSessionResumptionHandle()
+
+			conn, err := connectWithRetry(ctx, handle, connectFn)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+
+			shouldReconnect, terminated := lf.runSession(ctx, conn, queue, toolsFuncMap, yield)
+			if terminated || !shouldReconnect {
+				return
+			}
+
+			// Brief backoff before reconnecting; bail promptly on cancel so
+			// callers see context.Canceled instead of waiting out the timer.
+			if !sleepOrCancel(ctx, reconnectGoAwaySleep) {
+				return
 			}
 		}
+	}
+}
 
-		for attempt := 0; attempt <= maxReconnectRetries; attempt++ {
-			conn, err := connectFn(ctx.LiveSessionResumptionHandle())
-			if err != nil {
-				if attempt < maxReconnectRetries {
-					time.Sleep(time.Duration(attempt+1) * time.Second)
-					continue
-				}
-				yield(nil, fmt.Errorf("failed to connect live after %d retries: %w", maxReconnectRetries, err))
-				return
+func buildToolsFuncMap(tools []tool.Tool) map[string]toolinternal.FunctionTool {
+	m := make(map[string]toolinternal.FunctionTool)
+	for _, t := range tools {
+		if ft, ok := t.(toolinternal.FunctionTool); ok {
+			m[t.Name()] = ft
+		}
+	}
+	return m
+}
+
+// connectWithRetry attempts to connect up to maxReconnectRetries+1 times,
+// applying linear backoff between attempts. Returns context.Canceled (or
+// the deadline error) immediately if the parent context is cancelled at
+// any point — including during backoff — so callers do not wait out timers
+// after a cancel.
+func connectWithRetry(ctx context.Context, handle string, connectFn ConnectFn) (model.LiveConnection, error) {
+	var lastErr error
+	for attempt := 0; attempt <= maxReconnectRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		conn, err := connectFn(handle)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if attempt < maxReconnectRetries {
+			if !sleepOrCancel(ctx, time.Duration(attempt+1)*reconnectBaseBackoff) {
+				return nil, ctx.Err()
 			}
+		}
+	}
+	return nil, fmt.Errorf("failed to connect live after %d retries: %w", maxReconnectRetries, lastErr)
+}
 
-			// Reset retry budget after a successful connection so that
-			// GoAway-triggered reconnects don't exhaust it.
-			attempt = 0
+// sleepOrCancel waits for d to elapse or for ctx to be cancelled, returning
+// true if the duration elapsed and false if the context was cancelled.
+func sleepOrCancel(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
 
-			cancelCtx, cancel := context.WithCancel(ctx)
+// runSession runs a single live session over conn. It returns whether the
+// caller should attempt to reconnect (GoAway received) and whether the
+// iterator has been terminated by the consumer (yield returned false) or
+// by a fatal error during history replay.
+func (lf *LiveFlow) runSession(
+	ctx agent.InvocationContext,
+	conn model.LiveConnection,
+	queue *agent.LiveRequestQueue,
+	toolsFuncMap map[string]toolinternal.FunctionTool,
+	yield func(*session.Event, error) bool,
+) (shouldReconnect, terminated bool) {
+	cancelCtx, cancel := context.WithCancel(ctx)
 
-			if err := lf.sendHistory(cancelCtx, ctx, conn); err != nil {
-				cancel()
-				_ = conn.Close()
-				yield(nil, fmt.Errorf("history handoff failed: %w", err))
-				return
-			}
+	if err := lf.sendHistory(cancelCtx, ctx, conn); err != nil {
+		cancel()
+		_ = conn.Close()
+		yield(nil, fmt.Errorf("history handoff failed: %w", err))
+		return false, true
+	}
 
-			eventCh := make(chan eventOrError, 64)
-			var wg sync.WaitGroup
-			cs := &coalesceState{
-				buffer:         make(map[string]*genai.FunctionCall),
-				dedup:          make(map[string]string),
-				inFlightCancel: make(map[string]context.CancelFunc),
-				flushCh:        make(chan struct{}, 1),
-			}
+	eventCh, wg := lf.startSessionLoops(cancelCtx, ctx, conn, queue, toolsFuncMap)
 
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				lf.senderLoop(cancelCtx, conn, queue, eventCh)
-				_ = conn.Close()
-			}()
-
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				lf.receiverLoop(cancelCtx, ctx, conn, queue, cs, toolsFuncMap, eventCh, &wg)
-			}()
-
-			go func() {
-				wg.Wait()
-				close(eventCh)
-			}()
-
-			shouldReconnect := false
-			for msg := range eventCh {
-				// Handle session resumption updates.
-				if msg.event != nil && msg.event.SessionResumptionUpdate != nil {
-					upd := msg.event.SessionResumptionUpdate
-					if upd.Resumable {
-						if upd.NewHandle != "" {
-							ctx.SetLiveSessionResumptionHandle(upd.NewHandle)
-						}
-					} else {
-						// Non-resumable: clear any stale handle.
-						ctx.SetLiveSessionResumptionHandle("")
-					}
-				}
-				// Handle GoAway: trigger reconnection.
-				if msg.event != nil && msg.event.GoAway != nil {
-					shouldReconnect = true
-					break
-				}
-				if !yield(msg.event, msg.err) {
-					cancel()
-					_ = conn.Close()
-					wg.Wait()
-					return
-				}
-			}
-
+	for msg := range eventCh {
+		applySessionResumptionUpdate(ctx, msg)
+		if isGoAway(msg) {
+			shouldReconnect = true
+			break
+		}
+		if !yield(msg.event, msg.err) {
 			cancel()
 			_ = conn.Close()
 			wg.Wait()
-
-			if !shouldReconnect {
-				return
-			}
-			// Brief backoff before reconnecting.
-			time.Sleep(500 * time.Millisecond)
+			return false, true
 		}
 	}
+
+	cancel()
+	_ = conn.Close()
+	wg.Wait()
+	return shouldReconnect, false
+}
+
+// startSessionLoops launches the sender and receiver goroutines for a session
+// and returns the event channel they write to (closed once both exit) plus
+// the WaitGroup that tracks them.
+func (lf *LiveFlow) startSessionLoops(
+	cancelCtx context.Context,
+	invCtx agent.InvocationContext,
+	conn model.LiveConnection,
+	queue *agent.LiveRequestQueue,
+	toolsFuncMap map[string]toolinternal.FunctionTool,
+) (chan eventOrError, *sync.WaitGroup) {
+	eventCh := make(chan eventOrError, 64)
+	wg := &sync.WaitGroup{}
+	cs := &coalesceState{
+		buffer:         make(map[string]*genai.FunctionCall),
+		dedup:          make(map[string]string),
+		inFlightCancel: make(map[string]context.CancelFunc),
+		flushCh:        make(chan struct{}, 1),
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		lf.senderLoop(cancelCtx, conn, queue, eventCh)
+		_ = conn.Close()
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		lf.receiverLoop(cancelCtx, invCtx, conn, queue, cs, toolsFuncMap, eventCh, wg)
+	}()
+
+	go func() {
+		wg.Wait()
+		close(eventCh)
+	}()
+
+	return eventCh, wg
+}
+
+// applySessionResumptionUpdate mutates ctx's resumption handle in response
+// to a server-supplied SessionResumptionUpdate event, if the message carries
+// one. Non-resumable updates clear any stale handle so the next reconnect
+// uses an empty handle.
+func applySessionResumptionUpdate(ctx agent.InvocationContext, msg eventOrError) {
+	if msg.event == nil || msg.event.SessionResumptionUpdate == nil {
+		return
+	}
+	upd := msg.event.SessionResumptionUpdate
+	if !upd.Resumable {
+		ctx.SetLiveSessionResumptionHandle("")
+		return
+	}
+	if upd.NewHandle != "" {
+		ctx.SetLiveSessionResumptionHandle(upd.NewHandle)
+	}
+}
+
+func isGoAway(msg eventOrError) bool {
+	return msg.event != nil && msg.event.GoAway != nil
 }
 
 func (lf *LiveFlow) sendHistory(
@@ -240,19 +332,30 @@ func (lf *LiveFlow) senderLoop(
 				return
 			}
 		case <-queue.Done():
-			// Drain any buffered messages before exiting.
-			for {
-				select {
-				case req := <-queue.Events():
-					if err := conn.Send(ctx, req); err != nil {
-						sendEvent(ctx, eventCh, eventOrError{err: err})
-						return
-					}
-				default:
-					return
-				}
-			}
+			drainAndSend(ctx, conn, queue, eventCh)
+			return
 		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// drainAndSend non-blockingly drains any buffered queue events and forwards
+// them to conn before returning. Send errors are reported via eventCh.
+func drainAndSend(
+	ctx context.Context,
+	conn model.LiveConnection,
+	queue *agent.LiveRequestQueue,
+	eventCh chan<- eventOrError,
+) {
+	for {
+		select {
+		case req := <-queue.Events():
+			if err := conn.Send(ctx, req); err != nil {
+				sendEvent(ctx, eventCh, eventOrError{err: err})
+				return
+			}
+		default:
 			return
 		}
 	}
