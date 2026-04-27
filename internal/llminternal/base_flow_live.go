@@ -121,7 +121,10 @@ func (lf *LiveFlow) RunLive(
 
 			// Brief backoff before reconnecting; bail promptly on cancel so
 			// callers see context.Canceled instead of waiting out the timer.
+			// Yield the cancel error so consumers don't observe a silent
+			// iterator close that's indistinguishable from a clean exit.
 			if !sleepOrCancel(ctx, reconnectGoAwaySleep) {
+				yield(nil, ctx.Err())
 				return
 			}
 		}

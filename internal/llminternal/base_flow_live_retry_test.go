@@ -22,6 +22,8 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/genai"
+
 	"google.golang.org/adk/agent"
 	icontext "google.golang.org/adk/internal/context"
 	"google.golang.org/adk/model"
@@ -111,6 +113,81 @@ func TestRunLive_ContextCancelDuringReconnectBackoff(t *testing.T) {
 	}
 }
 
+// TestRunLive_ContextCancelDuringPostGoAwaySleep verifies that cancelling
+// the parent context during the post-GoAway pause (between the broken
+// session ending and the reconnect attempt) yields context.Canceled to the
+// iterator — not a silent close. A regression to a bare `return` would
+// drop the cancel error so consumers couldn't distinguish a clean exit
+// from a cancellation.
+//
+// Setup: stretch reconnectGoAwaySleep to 1s (well above the cancel window)
+// and schedule the cancel for 100ms after the first connect; with the fix,
+// wall time stays well under 300ms and the iterator yields ctx.Err().
+func TestRunLive_ContextCancelDuringPostGoAwaySleep(t *testing.T) {
+	withFastReconnectVars(t, 5, 10*time.Millisecond, time.Second)
+
+	parent, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	var connects atomic.Int32
+	connectFn := func(_ string) (model.LiveConnection, error) {
+		n := connects.Add(1)
+		if n == 1 {
+			// Schedule cancel to fire well into the 1s post-GoAway sleep,
+			// but well before it would naturally elapse.
+			time.AfterFunc(100*time.Millisecond, cancel)
+		}
+		return &goAwayThenBlockConn{}, nil
+	}
+
+	ctx := newTestInvocationContext(t, parent)
+	queue := agent.NewLiveRequestQueue(1)
+	flow := &LiveFlow{}
+	start := time.Now()
+
+	var lastErr error
+	for ev, err := range flow.RunLive(ctx, connectFn, queue) {
+		_ = ev
+		if err != nil {
+			lastErr = err
+		}
+	}
+	elapsed := time.Since(start)
+
+	if !errors.Is(lastErr, context.Canceled) {
+		t.Fatalf("expected context.Canceled to be yielded after post-GoAway cancel, got %v", lastErr)
+	}
+	if elapsed > 300*time.Millisecond {
+		t.Errorf("expected fast cancel, elapsed = %s (likely waited out the post-GoAway sleep)", elapsed)
+	}
+	if got := connects.Load(); got != 1 {
+		t.Errorf("expected exactly 1 connect attempt, got %d", got)
+	}
+}
+
+// goAwayThenBlockConn is a minimal model.LiveConnection that yields one
+// GoAway response on the first Receive and then blocks on context
+// cancellation, simulating a server that signalled GoAway and stopped
+// sending. It records nothing else — sufficient for tests that exercise
+// the post-GoAway code path.
+type goAwayThenBlockConn struct {
+	receives atomic.Int32
+}
+
+func (c *goAwayThenBlockConn) Send(_ context.Context, _ *model.LiveRequest) error {
+	return nil
+}
+
+func (c *goAwayThenBlockConn) Receive(ctx context.Context) (*model.LLMResponse, error) {
+	if c.receives.Add(1) == 1 {
+		return &model.LLMResponse{GoAway: &genai.LiveServerGoAway{}}, nil
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (c *goAwayThenBlockConn) Close() error { return nil }
+
 // withFastReconnectVars overrides the package-level reconnect knobs for the
 // duration of a test and restores them via t.Cleanup. Tests use small values
 // so they run in tens of milliseconds rather than seconds.
@@ -128,9 +205,9 @@ func withFastReconnectVars(t *testing.T, retries int, baseBackoff, goAwaySleep t
 }
 
 // newTestInvocationContext builds a minimal agent.InvocationContext suitable
-// for driving LiveFlow.RunLive in unit tests. Only the embedded context.Context
-// (for cancellation) and Session (for sendHistory) are exercised by tests
-// where connectFn fails before the session loops start.
+// for driving LiveFlow.RunLive in unit tests. The Agent is set so receiver-
+// side processing (which reads invCtx.Agent().Name() to label events) does
+// not nil-panic when a session actually starts.
 func newTestInvocationContext(t *testing.T, parent context.Context) agent.InvocationContext {
 	t.Helper()
 	resp, err := session.InMemoryService().Create(parent, &session.CreateRequest{
@@ -141,7 +218,12 @@ func newTestInvocationContext(t *testing.T, parent context.Context) agent.Invoca
 	if err != nil {
 		t.Fatalf("session create: %v", err)
 	}
+	a, err := agent.New(agent.Config{Name: "test_agent"})
+	if err != nil {
+		t.Fatalf("agent create: %v", err)
+	}
 	return icontext.NewInvocationContext(parent, icontext.InvocationContextParams{
 		Session: resp.Session,
+		Agent:   a,
 	})
 }
