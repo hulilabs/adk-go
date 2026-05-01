@@ -1976,8 +1976,13 @@ func TestScenario29_MultiTurnInterleaving(t *testing.T) {
 		name string
 		idx  int
 	}{
-		{"Hello", helloIdx}, {"Hi!", hiIdx}, {"fc", fcIdx}, {"fr", frIdx},
-		{"Found it", foundIdx}, {"Thanks", thanksIdx}, {"You're welcome", welcomeIdx},
+		{"Hello", helloIdx},
+		{"Hi!", hiIdx},
+		{"fc", fcIdx},
+		{"fr", frIdx},
+		{"Found it", foundIdx},
+		{"Thanks", thanksIdx},
+		{"You're welcome", welcomeIdx},
 	} {
 		if pair.idx < 0 {
 			t.Fatalf("missing %q in persisted events", pair.name)
