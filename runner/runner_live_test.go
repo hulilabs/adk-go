@@ -2389,6 +2389,89 @@ func hasContentSend(log []*model.LiveRequest) bool {
 }
 
 // ---------------------------------------------------------------------------
+// Scenario: resumed ConnectLive observes Transparent=true
+// ---------------------------------------------------------------------------
+
+func TestScenarioResumeUsesTransparentTrue(t *testing.T) {
+	// Pin the contract from withResumptionHandle: the initial connect uses
+	// the caller-provided SessionResumption (Transparent=false here), and
+	// the post-GoAway reconnect carries Transparent=true so the server
+	// keeps session state across the new transport.
+	conn1 := newMockLiveConnection()
+	conn1.recvCh = make(chan *model.LLMResponse, 10)
+
+	conn2 := newMockLiveConnection()
+	conn2.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+
+	llm := &resumptionMockLLM{
+		conns: []*mockLiveConnection{conn1, conn2},
+	}
+
+	a, _ := llmagent.New(llmagent.Config{
+		Name:  "test_agent",
+		Model: llm,
+	})
+
+	svc := &mockSessionService{Service: session.InMemoryService()}
+	_, _ = svc.Service.Create(context.Background(), &session.CreateRequest{
+		AppName: "test", UserID: "user1", SessionID: "sess1",
+	})
+
+	r, _ := New(Config{
+		AppName:        "test",
+		Agent:          a,
+		SessionService: svc,
+	})
+
+	queue := agent.NewLiveRequestQueue(100)
+
+	// Pre-load conn1 with a resumption update + GoAway.
+	conn1.recvCh <- &model.LLMResponse{
+		SessionResumptionUpdate: &genai.LiveServerSessionResumptionUpdate{
+			NewHandle: "h-resume",
+			Resumable: true,
+		},
+	}
+	conn1.recvCh <- &model.LLMResponse{GoAway: &genai.LiveServerGoAway{}}
+
+	closerDone := make(chan struct{})
+	go func() {
+		defer close(closerDone)
+		waitForCond(5*time.Second, func() bool { return len(llm.Calls()) >= 2 })
+		queue.Close()
+	}()
+
+	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{
+		// Caller opts into session resumption with Transparent=false; the
+		// resume path overwrites this on the second connect.
+		SessionResumption: &genai.SessionResumptionConfig{Transparent: false},
+	}) {
+		_ = ev
+		_ = err
+	}
+	<-closerDone
+
+	calls := llm.Calls()
+	if len(calls) < 2 {
+		t.Fatalf("expected at least 2 ConnectLive calls, got %d (%v)", len(calls), calls)
+	}
+	// Initial call: caller's Transparent=false carries through unchanged.
+	if calls[0].Handle != "" {
+		t.Errorf("calls[0].Handle = %q, want empty (initial fresh connect)", calls[0].Handle)
+	}
+	if calls[0].Transparent != false {
+		t.Errorf("calls[0].Transparent = %v, want false (caller's value preserved on initial connect)", calls[0].Transparent)
+	}
+	// Resume call: Handle is set, Transparent is overridden to true.
+	if calls[1].Handle != "h-resume" {
+		t.Errorf("calls[1].Handle = %q, want %q (resumed with saved handle)", calls[1].Handle, "h-resume")
+	}
+	if calls[1].Transparent != true {
+		t.Errorf("calls[1].Transparent = %v, want true (resume must keep server-side session state)", calls[1].Transparent)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Scenario: connection closed (EOF) after handle saved triggers reconnect
 // ---------------------------------------------------------------------------
 
