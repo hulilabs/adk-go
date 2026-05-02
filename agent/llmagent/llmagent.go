@@ -497,15 +497,27 @@ func (a *llmAgent) runLive(ctx agent.InvocationContext) iter.Seq2[*session.Event
 // When src is nil, the helper synthesizes a fresh config only if a handle
 // is supplied — preserving the caller's "no session resumption" intent
 // when the handle is empty.
+//
+// On resume (handle != ""), Transparent is set to true so the server keeps
+// session state across the new connection. This overrides any caller-set
+// Transparent value: resuming with Transparent=false would defeat the
+// purpose of resuming via GoAway. On the initial connect (handle == ""),
+// Transparent is left untouched.
 func withResumptionHandle(src *genai.SessionResumptionConfig, handle string) *genai.SessionResumptionConfig {
 	if src == nil {
 		if handle == "" {
 			return nil
 		}
-		return &genai.SessionResumptionConfig{Handle: handle}
+		return &genai.SessionResumptionConfig{
+			Handle:      handle,
+			Transparent: true,
+		}
 	}
 	cp := *src
 	cp.Handle = handle
+	if handle != "" {
+		cp.Transparent = true
+	}
 	return &cp
 }
 
