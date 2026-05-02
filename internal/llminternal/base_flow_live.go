@@ -23,6 +23,7 @@ import (
 	"io"
 	"iter"
 	"maps"
+	"strings"
 	"sync"
 	"time"
 
@@ -252,6 +253,59 @@ func sleepOrCancel(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// queueDone reports whether the LiveRequestQueue has been closed by the
+// caller (queue.Done() channel is signalled). Used to skip the close-
+// reconnect path during a client-initiated shutdown — without this gate,
+// closing the queue triggers conn.Close, which the receiver observes as
+// an EOF and would otherwise re-enter the reconnect cycle.
+func queueDone(queue *agent.LiveRequestQueue) bool {
+	select {
+	case <-queue.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// isConnectionClosed reports whether err looks like a closed transport:
+// io.EOF, an unexpectedly-closed read, or a WebSocket close frame with
+// code 1000 (normal) / 1006 (abnormal). When such a close arrives without
+// a preceding GoAway frame, callers can decide — based on whether a
+// resumption handle is available — whether to reconnect via the outer
+// reconnect cycle or surface the error.
+//
+// Permissive on purpose: when in doubt, prefer treating it as closed so
+// the outer cycle's retry budget remains the gate against runaway
+// reconnects.
+func isConnectionClosed(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	// gorilla/websocket's *CloseError exposes Code() int.
+	var ce interface{ Code() int }
+	if errors.As(err, &ce) {
+		switch ce.Code() {
+		case 1000, 1006:
+			return true
+		}
+	}
+	// Substring fallback for transports that render close frames as
+	// plain strings without a typed wrapper. Keep the patterns precise
+	// to avoid matching unrelated errors that happen to contain "close".
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "websocket: close 1000"),
+		strings.Contains(msg, "websocket: close 1006"),
+		strings.Contains(msg, "close 1000"),
+		strings.Contains(msg, "close 1006"):
+		return true
+	}
+	return false
+}
+
 // runSession runs a single live session over conn. It returns whether the
 // caller should attempt to reconnect (GoAway received) and whether the
 // iterator has been terminated by the consumer (yield returned false) or
@@ -288,6 +342,21 @@ func (lf *LiveFlow) runSession(
 	for msg := range eventCh {
 		applySessionResumptionUpdate(ctx, msg)
 		if isGoAway(msg) {
+			shouldReconnect = true
+			break
+		}
+		// The server may close the transport without a preceding GoAway
+		// frame (e.g., a normal close at code 1000 or an abnormal one at
+		// 1006, or a plain io.EOF). When we hold a resumption handle, the
+		// outer reconnect cycle is the right place to retry — surface the
+		// error instead and the iterator would terminate prematurely.
+		//
+		// Skip the reconnect path if the queue has already been drained
+		// (client-initiated shutdown): the sender exits on queue.Done(),
+		// which closes the connection and makes the receiver observe an
+		// EOF that is part of the natural unwind, not a server-initiated
+		// disconnect that warrants a reconnect.
+		if msg.err != nil && isConnectionClosed(msg.err) && ctx.LiveSessionResumptionHandle() != "" && !queueDone(queue) {
 			shouldReconnect = true
 			break
 		}
@@ -586,7 +655,16 @@ func (lf *LiveFlow) handleRecv(
 	guard *turnCycleGuard,
 ) bool {
 	if r.err != nil {
-		if ctx.Err() != nil || isEOF(r.err) {
+		if ctx.Err() != nil {
+			return true
+		}
+		// An EOF observed during a client-initiated shutdown (queue closed,
+		// sender exited and called conn.Close) is part of the natural
+		// unwind, not a server-initiated disconnect. Stay silent there to
+		// preserve the existing clean-shutdown contract; forward all other
+		// errors — including EOF mid-session — so runSession can decide
+		// whether to reconnect via the saved handle.
+		if isEOF(r.err) && queueDone(queue) {
 			return true
 		}
 		sendEvent(ctx, eventCh, eventOrError{err: r.err})
