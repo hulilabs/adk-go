@@ -520,6 +520,12 @@ func liveConfigFromRunConfig(rc *agent.RunConfig) *genai.LiveConnectConfig {
 }
 
 // applyLiveCapabilities maps v1.51.0 live session capabilities from RunConfig.
+//
+// Note: RunConfig.InitialHistoryInClientContent is intentionally NOT mapped
+// here. The pinned genai SDK (v1.40.0) has no HistoryConfig field, so the
+// flag is consumed inside internal/llminternal/base_flow_live.go to gate
+// the batched-history path instead. If a future SDK bump exposes a native
+// HistoryConfig knob, forward the flag here and remove the in-flow gating.
 func applyLiveCapabilities(rc *agent.RunConfig, cfg *genai.LiveConnectConfig) {
 	if rc.RealtimeInputConfig != nil {
 		cfg.RealtimeInputConfig = rc.RealtimeInputConfig

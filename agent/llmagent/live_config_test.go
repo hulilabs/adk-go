@@ -15,6 +15,7 @@
 package llmagent
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -177,4 +178,106 @@ func TestLiveConfigFromRunConfig(t *testing.T) {
 			t.Error("ContextWindowCompression should be nil when not set")
 		}
 	})
+}
+
+// TestLiveConfigFromRunConfig_InitialHistoryInClientContent_NotForwardedToSDK
+// pins the design contract: the flag is consumed inside the live flow, not
+// forwarded into genai.LiveConnectConfig. A future SDK bump that introduces a
+// native HistoryConfig field should make this test fail loudly so the
+// maintainer remembers to migrate the wiring.
+func TestLiveConfigFromRunConfig_InitialHistoryInClientContent_NotForwardedToSDK(t *testing.T) {
+	t.Parallel()
+
+	enabled := true
+	withFlag := liveConfigFromRunConfig(&agent.RunConfig{InitialHistoryInClientContent: &enabled})
+	without := liveConfigFromRunConfig(&agent.RunConfig{})
+
+	if diff := cmp.Diff(without, withFlag); diff != "" {
+		t.Errorf("InitialHistoryInClientContent must not affect genai.LiveConnectConfig (-without +withFlag):\n%s", diff)
+	}
+}
+
+// expectedLiveConnectConfigFieldCount pins the field count of
+// genai.LiveConnectConfig as observed against the pinned SDK
+// (google.golang.org/genai v1.40.0). When the SDK adds or removes a field —
+// most notably if it introduces a native HistoryConfig knob — this constant
+// will mismatch and TestLiveConnectConfig_FieldCount_PinsSDKShape fails.
+// Treat that failure as a signal to: (a) bump this constant after auditing
+// the new field, and (b) consider whether
+// RunConfig.InitialHistoryInClientContent should now be forwarded into
+// genai.LiveConnectConfig instead of consumed inside the live flow.
+const expectedLiveConnectConfigFieldCount = 20
+
+// TestLiveConnectConfig_FieldCount_PinsSDKShape uses reflection to detect
+// SDK struct shape changes. Distinct from the diff-based test above: this
+// fires even when a new field is added that we don't currently set, so it
+// catches forward-compatibility risks before they become silent skips.
+func TestLiveConnectConfig_FieldCount_PinsSDKShape(t *testing.T) {
+	t.Parallel()
+
+	got := reflect.TypeOf(genai.LiveConnectConfig{}).NumField()
+	if got != expectedLiveConnectConfigFieldCount {
+		t.Errorf(
+			"genai.LiveConnectConfig has %d fields, expected %d. The SDK shape changed; "+
+				"audit the new/removed field and update expectedLiveConnectConfigFieldCount. "+
+				"If a HistoryConfig (or equivalent) field appeared, also wire "+
+				"RunConfig.InitialHistoryInClientContent through applyLiveCapabilities "+
+				"and remove the in-flow gating in internal/llminternal/base_flow_live.go.",
+			got, expectedLiveConnectConfigFieldCount,
+		)
+	}
+}
+
+// TestLiveConfigFromRunConfig_InitialHistoryInClientContent_AllStates exercises
+// nil, *true, and *false. Every state must produce the same output as omitting
+// the flag entirely.
+func TestLiveConfigFromRunConfig_InitialHistoryInClientContent_AllStates(t *testing.T) {
+	t.Parallel()
+
+	trueVal, falseVal := true, false
+	cases := []struct {
+		name string
+		flag *bool
+	}{
+		{"nil", nil},
+		{"true", &trueVal},
+		{"false", &falseVal},
+	}
+
+	baseline := liveConfigFromRunConfig(&agent.RunConfig{})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := liveConfigFromRunConfig(&agent.RunConfig{InitialHistoryInClientContent: tc.flag})
+			if diff := cmp.Diff(baseline, got); diff != "" {
+				t.Errorf("flag=%s changed config (-baseline +got):\n%s", tc.name, diff)
+			}
+		})
+	}
+}
+
+// TestLiveConfigFromRunConfig_PreservesExistingFields_WithFlagSet ensures the
+// new flag does not disturb existing live-capability wiring.
+func TestLiveConfigFromRunConfig_PreservesExistingFields_WithFlagSet(t *testing.T) {
+	t.Parallel()
+
+	enabled := true
+	enableAffective := true
+	rc := &agent.RunConfig{
+		Proactivity: &genai.ProactivityConfig{},
+		SessionResumption: &genai.SessionResumptionConfig{
+			Handle: "h",
+		},
+		EnableAffectiveDialog:         &enableAffective,
+		InitialHistoryInClientContent: &enabled,
+	}
+
+	got := liveConfigFromRunConfig(rc)
+	want := &genai.LiveConnectConfig{
+		Proactivity:           &genai.ProactivityConfig{},
+		SessionResumption:     &genai.SessionResumptionConfig{Handle: "h"},
+		EnableAffectiveDialog: &enableAffective,
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("mismatch (-want +got):\n%s", diff)
+	}
 }

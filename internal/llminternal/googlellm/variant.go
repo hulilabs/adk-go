@@ -61,6 +61,14 @@ func IsGemini25OrLower(model string) bool {
 	return version <= 2.5
 }
 
+// IsGemini3X reports whether the model name resolves to a Gemini 3.<minor>
+// release. Uses strict prefix matching against "gemini-3." after extracting
+// the bare model name. Returns false on parse failure or non-3.x major
+// versions; callers must NOT treat unknown models as 3.x.
+func IsGemini3X(modelName string) bool {
+	return strings.HasPrefix(extractModelName(modelName), "gemini-3.")
+}
+
 // IsGeminiAPIVariant returns true if the model is a Gemini API model (not Vertex AI).
 func IsGeminiAPIVariant(llm model.LLM) bool {
 	return GetGoogleLLMVariant(llm) == genai.BackendGeminiAPI

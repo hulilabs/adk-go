@@ -91,6 +91,7 @@ func (m *mockLiveConnection) Receive(ctx context.Context) (*model.LLMResponse, e
 			if m.recvErrAt >= 0 && idx == m.recvErrAt {
 				return nil, m.recvErr
 			}
+			stampReceivedAt(resp)
 			return resp, nil
 		case <-m.closedCh:
 			return nil, io.EOF
@@ -110,7 +111,17 @@ func (m *mockLiveConnection) Receive(ctx context.Context) (*model.LLMResponse, e
 	}
 	resp := m.recvResponses[m.recvIdx]
 	m.recvIdx++
+	stampReceivedAt(resp)
 	return resp, nil
+}
+
+// stampReceivedAt mirrors what model/gemini's real Receive does: stamp the
+// wall-clock receive instant so liveTimingState can compute TimeSinceLastSend.
+// Tests that pre-set ReceivedAt are not overwritten.
+func stampReceivedAt(resp *model.LLMResponse) {
+	if resp != nil && resp.ReceivedAt.IsZero() {
+		resp.ReceivedAt = time.Now()
+	}
 }
 
 func (m *mockLiveConnection) Close() error {
@@ -133,6 +144,43 @@ func (m *mockLiveConnection) WasClosed() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.closeCalled
+}
+
+// mockBatchedLiveConnection embeds mockLiveConnection and additionally records
+// SendBatchedHistory invocations. Used to verify the gemini-3.x history
+// batching path: per-turn replays land in mockLiveConnection.SendLog while
+// batched calls land in BatchedTurns.
+type mockBatchedLiveConnection struct {
+	*mockLiveConnection
+	bmu           sync.Mutex
+	batchedTurns  [][]*genai.Content
+	batchedSentAt []time.Time
+}
+
+func newMockBatchedLiveConnection() *mockBatchedLiveConnection {
+	return &mockBatchedLiveConnection{mockLiveConnection: newMockLiveConnection()}
+}
+
+func (m *mockBatchedLiveConnection) SendBatchedHistory(_ context.Context, turns []*genai.Content) error {
+	m.bmu.Lock()
+	defer m.bmu.Unlock()
+	cp := make([]*genai.Content, len(turns))
+	copy(cp, turns)
+	m.batchedTurns = append(m.batchedTurns, cp)
+	m.batchedSentAt = append(m.batchedSentAt, time.Now())
+	return nil
+}
+
+func (m *mockBatchedLiveConnection) BatchedTurns() [][]*genai.Content {
+	m.bmu.Lock()
+	defer m.bmu.Unlock()
+	out := make([][]*genai.Content, len(m.batchedTurns))
+	for i, t := range m.batchedTurns {
+		cp := make([]*genai.Content, len(t))
+		copy(cp, t)
+		out[i] = cp
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -241,12 +289,12 @@ func (m *mockSessionService) PersistedEvents() []*session.Event {
 // Helpers
 // ---------------------------------------------------------------------------
 
-func setupRunner(t *testing.T, conn *mockLiveConnection, tools []tool.Tool, plugins []*plugin.Plugin) (*Runner, *mockSessionService, session.Session) {
+func setupRunner(t *testing.T, conn model.LiveConnection, tools []tool.Tool, plugins []*plugin.Plugin) (*Runner, *mockSessionService, session.Session) {
 	t.Helper()
 	return setupRunnerWithEvents(t, conn, tools, plugins, nil)
 }
 
-func setupRunnerWithEvents(t *testing.T, conn *mockLiveConnection, tools []tool.Tool, plugins []*plugin.Plugin, priorEvents []*session.Event) (*Runner, *mockSessionService, session.Session) {
+func setupRunnerWithEvents(t *testing.T, conn model.LiveConnection, tools []tool.Tool, plugins []*plugin.Plugin, priorEvents []*session.Event) (*Runner, *mockSessionService, session.Session) {
 	t.Helper()
 
 	innerSvc := session.InMemoryService()
@@ -300,9 +348,14 @@ func setupRunnerWithEvents(t *testing.T, conn *mockLiveConnection, tools []tool.
 
 func collectEvents(t *testing.T, r *Runner, queue *agent.LiveRequestQueue) ([]*session.Event, []error) {
 	t.Helper()
+	return collectEventsWithConfig(t, r, queue, agent.RunConfig{})
+}
+
+func collectEventsWithConfig(t *testing.T, r *Runner, queue *agent.LiveRequestQueue, cfg agent.RunConfig) ([]*session.Event, []error) {
+	t.Helper()
 	var events []*session.Event
 	var errs []error
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
+	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -312,6 +365,8 @@ func collectEvents(t *testing.T, r *Runner, queue *agent.LiveRequestQueue) ([]*s
 	}
 	return events, errs
 }
+
+func ptrBool(b bool) *bool { return &b }
 
 func textResponse(text string) *model.LLMResponse {
 	return &model.LLMResponse{
@@ -2057,5 +2112,347 @@ func TestScenario30_InputFlushedBeforeTextContent(t *testing.T) {
 	}
 	if persisted[1].Author == "user" {
 		t.Error("second persisted event should not have Author=user")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 31: Gemini-3.x history routes through batched path
+// ---------------------------------------------------------------------------
+
+func TestScenario31_HistoryBatched_Gemini3(t *testing.T) {
+	conn := newMockBatchedLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+
+	priorEvents := []*session.Event{
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("Hi", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("Hello", "model")}, Author: "test_agent"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("Weather?", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("Sunny", "model")}, Author: "test_agent"},
+	}
+
+	r, _, _ := setupRunnerWithEvents(t, conn, nil, nil, priorEvents)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	cfg := agent.RunConfig{Model: "gemini-3.1-flash-live-preview"}
+	_, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	batched := conn.BatchedTurns()
+	if len(batched) != 1 {
+		t.Fatalf("expected 1 batched call, got %d", len(batched))
+	}
+	if len(batched[0]) != 4 {
+		t.Errorf("expected 4 turns in batch, got %d", len(batched[0]))
+	}
+	for i, req := range conn.SendLog() {
+		if req.Content != nil {
+			t.Errorf("send[%d] should not contain history Content; got %+v", i, req.Content)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 32: Gemini-2.5 history uses per-turn replay (regression guard)
+// ---------------------------------------------------------------------------
+
+func TestScenario32_HistoryPerTurn_Gemini25_Explicit(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+
+	priorEvents := []*session.Event{
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("a", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("b", "model")}, Author: "test_agent"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("c", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("d", "model")}, Author: "test_agent"},
+	}
+
+	r, _, _ := setupRunnerWithEvents(t, conn, nil, nil, priorEvents)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	cfg := agent.RunConfig{Model: "gemini-2.5-flash-native-audio-latest"}
+	_, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	sendLog := conn.SendLog()
+	if len(sendLog) != 4 {
+		t.Fatalf("expected 4 per-turn history sends, got %d", len(sendLog))
+	}
+	for i := 0; i < 3; i++ {
+		if sendLog[i].Content == nil {
+			t.Errorf("send[%d] should have Content", i)
+		}
+		if sendLog[i].TurnComplete == nil || *sendLog[i].TurnComplete {
+			t.Errorf("send[%d] should have TurnComplete=&false", i)
+		}
+	}
+	if sendLog[3].Content == nil {
+		t.Error("send[3] should have Content")
+	}
+	if sendLog[3].TurnComplete != nil {
+		t.Errorf("send[3] should have TurnComplete=nil (default true), got %+v", sendLog[3].TurnComplete)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 33: Gemini-3.x with empty history performs no sends
+// ---------------------------------------------------------------------------
+
+func TestScenario33_HistoryBatched_Empty_Gemini3(t *testing.T) {
+	conn := newMockBatchedLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+
+	r, _, _ := setupRunnerWithEvents(t, conn, nil, nil, nil)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	cfg := agent.RunConfig{Model: "gemini-3.1-flash-live-preview"}
+	_, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if got := len(conn.BatchedTurns()); got != 0 {
+		t.Errorf("expected no batched calls for empty history, got %d", got)
+	}
+	if got := len(conn.SendLog()); got != 0 {
+		t.Errorf("expected no per-turn sends for empty history, got %d", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 34: Gemini-3.x batches mixed text + function-call history intact
+// ---------------------------------------------------------------------------
+
+func TestScenario34_HistoryBatched_FunctionCall_Gemini3(t *testing.T) {
+	conn := newMockBatchedLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+
+	fcContent := &genai.Content{
+		Role:  "model",
+		Parts: []*genai.Part{{FunctionCall: &genai.FunctionCall{ID: "fc1", Name: "lookup"}}},
+	}
+	frContent := &genai.Content{
+		Role: "user",
+		Parts: []*genai.Part{
+			{FunctionResponse: &genai.FunctionResponse{ID: "fc1", Name: "lookup", Response: map[string]any{"ok": true}}},
+		},
+	}
+
+	priorEvents := []*session.Event{
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("look it up", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: fcContent}, Author: "test_agent"},
+		{LLMResponse: model.LLMResponse{Content: frContent}, Author: "user"},
+	}
+
+	r, _, _ := setupRunnerWithEvents(t, conn, nil, nil, priorEvents)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	cfg := agent.RunConfig{Model: "gemini-3.1-flash-live-preview"}
+	_, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	batched := conn.BatchedTurns()
+	if len(batched) != 1 || len(batched[0]) != 3 {
+		t.Fatalf("expected 1 batched call with 3 turns, got %d call(s) / %v", len(batched), batched)
+	}
+	if batched[0][1].Parts[0].FunctionCall == nil {
+		t.Error("function-call part lost during batching")
+	}
+	if batched[0][2].Parts[0].FunctionResponse == nil {
+		t.Error("function-response part lost during batching")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 35: Gemini-3.x rewrites text-only user turns to RealtimeInput
+// ---------------------------------------------------------------------------
+
+func TestScenario35_MidSessionTextRewrite_Gemini3(t *testing.T) {
+	conn := newMockLiveConnection()
+
+	r, _, _ := setupRunner(t, conn, nil, nil)
+	queue := agent.NewLiveRequestQueue(100)
+
+	falseVal := false
+	_ = queue.Send(context.Background(), &model.LiveRequest{
+		Content: genai.NewContentFromText("hello there", "user"),
+	})
+	_ = queue.Send(context.Background(), &model.LiveRequest{
+		Content: &genai.Content{
+			Role: "user",
+			Parts: []*genai.Part{
+				{Text: "see this"},
+				{InlineData: &genai.Blob{MIMEType: "image/png", Data: []byte{1, 2}}},
+			},
+		},
+	})
+	_ = queue.Send(context.Background(), &model.LiveRequest{
+		Content:      genai.NewContentFromText("partial", "user"),
+		TurnComplete: &falseVal,
+	})
+	// Multi-part text-only turn: must NOT be rewritten — joining/trimming
+	// would mutate user text. Single-part-only is the strict contract.
+	_ = queue.Send(context.Background(), &model.LiveRequest{
+		Content: &genai.Content{
+			Role: "user",
+			Parts: []*genai.Part{
+				{Text: "  leading"},
+				{Text: "trailing  "},
+			},
+		},
+	})
+	queue.Close()
+
+	cfg := agent.RunConfig{Model: "gemini-3.1-flash-live-preview"}
+	_, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	sendLog := conn.SendLog()
+	if len(sendLog) != 4 {
+		t.Fatalf("expected 4 sends, got %d", len(sendLog))
+	}
+	if sendLog[0].Content != nil {
+		t.Errorf("send[0] should have Content==nil after rewrite, got %+v", sendLog[0].Content)
+	}
+	if sendLog[0].RealtimeInput == nil || sendLog[0].RealtimeInput.Text != "hello there" {
+		t.Errorf("send[0] should have RealtimeInput.Text='hello there', got %+v", sendLog[0].RealtimeInput)
+	}
+	if sendLog[1].Content == nil {
+		t.Error("send[1] (mixed-media) should retain Content")
+	}
+	if sendLog[1].RealtimeInput != nil {
+		t.Errorf("send[1] (mixed-media) should NOT be rewritten, got %+v", sendLog[1].RealtimeInput)
+	}
+	if sendLog[2].Content == nil {
+		t.Error("send[2] (partial turn) should retain Content")
+	}
+	if sendLog[2].TurnComplete == nil || *sendLog[2].TurnComplete {
+		t.Errorf("send[2] should retain TurnComplete=&false, got %+v", sendLog[2].TurnComplete)
+	}
+	if sendLog[3].Content == nil {
+		t.Error("send[3] (multi-part text) should retain Content (no lossy join)")
+	}
+	if sendLog[3].RealtimeInput != nil {
+		t.Errorf("send[3] (multi-part text) should NOT be rewritten, got %+v", sendLog[3].RealtimeInput)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 36: Gemini-2.5 mid-session text NOT rewritten (regression guard)
+// ---------------------------------------------------------------------------
+
+func TestScenario36_MidSessionTextRewrite_Gemini25_NotApplied(t *testing.T) {
+	conn := newMockLiveConnection()
+
+	r, _, _ := setupRunner(t, conn, nil, nil)
+	queue := agent.NewLiveRequestQueue(100)
+
+	_ = queue.Send(context.Background(), &model.LiveRequest{
+		Content: genai.NewContentFromText("hi 2.5", "user"),
+	})
+	queue.Close()
+
+	cfg := agent.RunConfig{Model: "gemini-2.5-flash-native-audio-latest"}
+	_, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	sendLog := conn.SendLog()
+	if len(sendLog) != 1 {
+		t.Fatalf("expected 1 send, got %d", len(sendLog))
+	}
+	if sendLog[0].Content == nil {
+		t.Error("2.5 mid-session user turn should retain Content")
+	}
+	if sendLog[0].RealtimeInput != nil {
+		t.Errorf("2.5 mid-session turn should NOT be rewritten, got %+v", sendLog[0].RealtimeInput)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 37: explicit InitialHistoryInClientContent=false overrides 3.x auto-detection
+// ---------------------------------------------------------------------------
+
+func TestScenario37_HistoryBatched_ExplicitFalse_Gemini3(t *testing.T) {
+	conn := newMockBatchedLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+
+	priorEvents := []*session.Event{
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("hi", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("hello", "model")}, Author: "test_agent"},
+	}
+
+	r, _, _ := setupRunnerWithEvents(t, conn, nil, nil, priorEvents)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	cfg := agent.RunConfig{
+		Model:                         "gemini-3.1-flash-live-preview",
+		InitialHistoryInClientContent: ptrBool(false),
+	}
+	_, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if got := len(conn.BatchedTurns()); got != 0 {
+		t.Errorf("expected no batched calls when InitialHistoryInClientContent=false, got %d", got)
+	}
+	if got := len(conn.SendLog()); got != 2 {
+		t.Errorf("expected 2 per-turn sends after override, got %d", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 38: trackedSendBatchedHistory records send timing for diagnostics
+// ---------------------------------------------------------------------------
+
+func TestScenario38_HistoryBatched_LastSendTimeRecorded(t *testing.T) {
+	conn := newMockBatchedLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{
+		textResponse("ack"),
+		turnCompleteResponse(),
+	}
+
+	priorEvents := []*session.Event{
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("a", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("b", "model")}, Author: "test_agent"},
+	}
+
+	r, _, _ := setupRunnerWithEvents(t, conn, nil, nil, priorEvents)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	cfg := agent.RunConfig{Model: "gemini-3.1-flash-live-preview"}
+	events, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if got := len(conn.BatchedTurns()); got != 1 {
+		t.Fatalf("expected 1 batched call, got %d", got)
+	}
+
+	sawNonZero := false
+	for _, ev := range events {
+		if ev.LiveDiagnostics != nil && ev.LiveDiagnostics.TimeSinceLastSend > 0 {
+			sawNonZero = true
+			break
+		}
+	}
+	if !sawNonZero {
+		t.Error("expected at least one event with TimeSinceLastSend > 0 (batched send not recorded in liveTimingState)")
 	}
 }

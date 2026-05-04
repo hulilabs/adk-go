@@ -86,6 +86,14 @@ type LiveConnection interface {
 	Close() error
 }
 
+// BatchedHistorySender is an optional capability that a LiveConnection may
+// implement to deliver session history as a single batched client-content
+// call rather than streaming per-turn replays. Used to avoid Gemini 3.x's
+// 1008 policy rejection of mid-session client_content replays.
+type BatchedHistorySender interface {
+	SendBatchedHistory(ctx context.Context, turns []*genai.Content) error
+}
+
 // LiveCapableLLM is an optional interface for LLM implementations
 // that support live bidirectional streaming connections.
 type LiveCapableLLM interface {
