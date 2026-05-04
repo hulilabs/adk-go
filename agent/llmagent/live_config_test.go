@@ -190,7 +190,6 @@ func TestWithResumptionHandle(t *testing.T) {
 		handle      string
 		wantNil     bool
 		wantHandle  string
-		wantTrans   bool
 		wantTransOK bool // expected value of cp.Transparent when wantNil is false
 	}{
 		{

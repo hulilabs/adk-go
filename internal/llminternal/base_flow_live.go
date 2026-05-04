@@ -293,13 +293,11 @@ func isConnectionClosed(err error) bool {
 		}
 	}
 	// Substring fallback for transports that render close frames as
-	// plain strings without a typed wrapper. Keep the patterns precise
-	// to avoid matching unrelated errors that happen to contain "close".
+	// plain strings without a typed wrapper. "close 1000" / "close 1006"
+	// are supersets of "websocket: close 100X" so we don't need both.
 	msg := err.Error()
 	switch {
-	case strings.Contains(msg, "websocket: close 1000"),
-		strings.Contains(msg, "websocket: close 1006"),
-		strings.Contains(msg, "close 1000"),
+	case strings.Contains(msg, "close 1000"),
 		strings.Contains(msg, "close 1006"):
 		return true
 	}
