@@ -48,6 +48,35 @@ func TestIsGemini25OrLower(t *testing.T) {
 	}
 }
 
+func TestIsGemini3X(t *testing.T) {
+	testCases := []struct {
+		model string
+		want  bool
+	}{
+		{"gemini-3.0", true},
+		{"gemini-3.1-flash-live-preview", true},
+		{"gemini-3.5-pro", true},
+		{"models/gemini-3.0", true},
+		{"projects/p/locations/l/models/gemini-3.1-pro", true},
+		{"Gemini-3.1", true}, // case-folded by extractModelName
+		{"gemini-3-pro", false},
+		{"gemini-3-foo", false},
+		{"gemini-30-foo", false},
+		{"gemini-2.5-flash", false},
+		{"gemini-2.5-flash-native-audio-latest", false},
+		{"gemini-4.0", false},
+		{"not-a-gemini-model", false},
+		{"", false},
+	}
+
+	for _, tc := range testCases {
+		got := IsGemini3X(tc.model)
+		if got != tc.want {
+			t.Errorf("IsGemini3X(%q) = %v, want %v", tc.model, got, tc.want)
+		}
+	}
+}
+
 func TestIsGeminiModel(t *testing.T) {
 	testCases := []struct {
 		model string

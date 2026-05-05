@@ -68,4 +68,22 @@ type RunConfig struct {
 	Proactivity              *genai.ProactivityConfig
 	EnableAffectiveDialog    *bool
 	ContextWindowCompression *genai.ContextWindowCompressionConfig
+
+	// InitialHistoryInClientContent, when true, bundles session history into a
+	// single client-content batch sent before the first user turn instead of
+	// streaming per-turn replays. Auto-enabled for gemini-3.x models when nil;
+	// per-turn replays trigger a 1008 policy violation on those models. Set
+	// explicitly to a false pointer to override the auto-derivation.
+	//
+	// Only consulted when the live session is on its initial connect
+	// (handle == ""). Reconnects with a saved resumption handle never replay
+	// history regardless of this flag — composes with #36.
+	//
+	// Note: genai SDK v1.40.0 has no HistoryConfig field, so this flag is
+	// consumed inside the live flow rather than forwarded into
+	// genai.LiveConnectConfig. The naming preserves parity with adk-python
+	// PR #5076. A reflection tripwire in agent/llmagent/live_config_test.go
+	// will fire if a future SDK bump introduces a History* field on
+	// LiveConnectConfig, prompting native wiring at that time.
+	InitialHistoryInClientContent *bool
 }

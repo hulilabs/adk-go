@@ -15,6 +15,8 @@
 package llmagent
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -270,5 +272,79 @@ func TestWithResumptionHandle(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestLiveConfigFromRunConfig_InitialHistoryInClientContent_NotForwardedToSDK
+// pins the design contract: the flag is consumed inside the live flow, not
+// forwarded into genai.LiveConnectConfig. A future SDK bump that introduces
+// a native HistoryConfig field should make the reflection tripwire below
+// fail loudly, prompting the maintainer to migrate the wiring.
+func TestLiveConfigFromRunConfig_InitialHistoryInClientContent_NotForwardedToSDK(t *testing.T) {
+	t.Parallel()
+
+	enabled := true
+	withFlag := liveConfigFromRunConfig(&agent.RunConfig{
+		Model:                         "gemini-3.1-flash-live-preview",
+		InitialHistoryInClientContent: &enabled,
+	})
+	without := liveConfigFromRunConfig(&agent.RunConfig{
+		Model: "gemini-3.1-flash-live-preview",
+	})
+
+	if diff := cmp.Diff(without, withFlag); diff != "" {
+		t.Errorf("InitialHistoryInClientContent must not affect genai.LiveConnectConfig (-without +withFlag):\n%s", diff)
+	}
+}
+
+// TestLiveConfigFromRunConfig_InitialHistoryInClientContent_AllStates exercises
+// nil, *true, and *false. Every state must produce the same output as omitting
+// the flag entirely (it is consumed in-flow, not on the SDK config).
+func TestLiveConfigFromRunConfig_InitialHistoryInClientContent_AllStates(t *testing.T) {
+	t.Parallel()
+
+	trueVal, falseVal := true, false
+	cases := []struct {
+		name string
+		flag *bool
+	}{
+		{"nil", nil},
+		{"true", &trueVal},
+		{"false", &falseVal},
+	}
+
+	baseline := liveConfigFromRunConfig(&agent.RunConfig{})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := liveConfigFromRunConfig(&agent.RunConfig{InitialHistoryInClientContent: tc.flag})
+			if diff := cmp.Diff(baseline, got); diff != "" {
+				t.Errorf("flag=%s changed config (-baseline +got):\n%s", tc.name, diff)
+			}
+		})
+	}
+}
+
+// TestLiveConfigFromRunConfig_HistoryConfigTripwire_FailsIfSDKAdds is the
+// reflection tripwire: it inspects genai.LiveConnectConfig for any field
+// containing "History" in its name. Today (genai v1.40.0) there is no such
+// field, so the test passes. The moment the SDK ships a HistoryConfig
+// (analogous to adk-python's HistoryConfig knob) the test fires, prompting
+// the maintainer to wire RunConfig.InitialHistoryInClientContent into
+// applyLiveCapabilities and remove the in-flow gating in
+// internal/llminternal/base_flow_live.go.
+func TestLiveConfigFromRunConfig_HistoryConfigTripwire_FailsIfSDKAdds(t *testing.T) {
+	t.Parallel()
+
+	cfgType := reflect.TypeOf(genai.LiveConnectConfig{})
+	for i := 0; i < cfgType.NumField(); i++ {
+		f := cfgType.Field(i)
+		if strings.Contains(f.Name, "History") {
+			t.Fatalf(
+				"genai.LiveConnectConfig has new field %q; wire "+
+					"RunConfig.InitialHistoryInClientContent into applyLiveCapabilities "+
+					"and remove the base_flow_live.go batched-history workaround",
+				f.Name,
+			)
+		}
 	}
 }

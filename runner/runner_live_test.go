@@ -135,6 +135,43 @@ func (m *mockLiveConnection) WasClosed() bool {
 	return m.closeCalled
 }
 
+// mockBatchedLiveConnection embeds mockLiveConnection and additionally records
+// SendBatchedHistory invocations. Used to verify the gemini-3.x history
+// batching path: per-turn replays land in mockLiveConnection.SendLog while
+// batched calls land in BatchedTurns.
+type mockBatchedLiveConnection struct {
+	*mockLiveConnection
+	bmu           sync.Mutex
+	batchedTurns  [][]*genai.Content
+	batchedSentAt []time.Time
+}
+
+func newMockBatchedLiveConnection() *mockBatchedLiveConnection {
+	return &mockBatchedLiveConnection{mockLiveConnection: newMockLiveConnection()}
+}
+
+func (m *mockBatchedLiveConnection) SendBatchedHistory(_ context.Context, turns []*genai.Content) error {
+	m.bmu.Lock()
+	defer m.bmu.Unlock()
+	cp := make([]*genai.Content, len(turns))
+	copy(cp, turns)
+	m.batchedTurns = append(m.batchedTurns, cp)
+	m.batchedSentAt = append(m.batchedSentAt, time.Now())
+	return nil
+}
+
+func (m *mockBatchedLiveConnection) BatchedTurns() [][]*genai.Content {
+	m.bmu.Lock()
+	defer m.bmu.Unlock()
+	out := make([][]*genai.Content, len(m.batchedTurns))
+	for i, t := range m.batchedTurns {
+		cp := make([]*genai.Content, len(t))
+		copy(cp, t)
+		out[i] = cp
+	}
+	return out
+}
+
 // ---------------------------------------------------------------------------
 // Mock: Tool
 // ---------------------------------------------------------------------------
@@ -241,12 +278,12 @@ func (m *mockSessionService) PersistedEvents() []*session.Event {
 // Helpers
 // ---------------------------------------------------------------------------
 
-func setupRunner(t *testing.T, conn *mockLiveConnection, tools []tool.Tool, plugins []*plugin.Plugin) (*Runner, *mockSessionService, session.Session) {
+func setupRunner(t *testing.T, conn model.LiveConnection, tools []tool.Tool, plugins []*plugin.Plugin) (*Runner, *mockSessionService, session.Session) {
 	t.Helper()
 	return setupRunnerWithEvents(t, conn, tools, plugins, nil)
 }
 
-func setupRunnerWithEvents(t *testing.T, conn *mockLiveConnection, tools []tool.Tool, plugins []*plugin.Plugin, priorEvents []*session.Event) (*Runner, *mockSessionService, session.Session) {
+func setupRunnerWithEvents(t *testing.T, conn model.LiveConnection, tools []tool.Tool, plugins []*plugin.Plugin, priorEvents []*session.Event) (*Runner, *mockSessionService, session.Session) {
 	t.Helper()
 
 	innerSvc := session.InMemoryService()
@@ -300,9 +337,14 @@ func setupRunnerWithEvents(t *testing.T, conn *mockLiveConnection, tools []tool.
 
 func collectEvents(t *testing.T, r *Runner, queue *agent.LiveRequestQueue) ([]*session.Event, []error) {
 	t.Helper()
+	return collectEventsWithConfig(t, r, queue, agent.RunConfig{})
+}
+
+func collectEventsWithConfig(t *testing.T, r *Runner, queue *agent.LiveRequestQueue, cfg agent.RunConfig) ([]*session.Event, []error) {
+	t.Helper()
 	var events []*session.Event
 	var errs []error
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
+	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -312,6 +354,8 @@ func collectEvents(t *testing.T, r *Runner, queue *agent.LiveRequestQueue) ([]*s
 	}
 	return events, errs
 }
+
+func ptrBool(b bool) *bool { return &b }
 
 func textResponse(text string) *model.LLMResponse {
 	return &model.LLMResponse{
@@ -2629,4 +2673,400 @@ func TestScenarioConnectionEOFWithoutHandleYieldsError(t *testing.T) {
 	// the runner must not reconnect a second time blindly with an empty
 	// handle.
 	_ = yieldedErrs
+}
+
+// ---------------------------------------------------------------------------
+// Issue #19: Gemini-3.x batched-history routing (composes with #36)
+// ---------------------------------------------------------------------------
+
+// TestScenario31_HistoryBatched_Gemini3 verifies that 3.x models route
+// history through SendBatchedHistory rather than the per-turn loop, on the
+// initial connect (handle == "").
+func TestScenario31_HistoryBatched_Gemini3(t *testing.T) {
+	conn := newMockBatchedLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+
+	priorEvents := []*session.Event{
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("Hi", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("Hello", "model")}, Author: "test_agent"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("Weather?", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("Sunny", "model")}, Author: "test_agent"},
+	}
+
+	r, _, _ := setupRunnerWithEvents(t, conn, nil, nil, priorEvents)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	cfg := agent.RunConfig{Model: "gemini-3.1-flash-live-preview"}
+	_, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	batched := conn.BatchedTurns()
+	if len(batched) != 1 {
+		t.Fatalf("expected 1 batched call, got %d", len(batched))
+	}
+	if len(batched[0]) != 4 {
+		t.Errorf("expected 4 turns in batch, got %d", len(batched[0]))
+	}
+	for i, req := range conn.SendLog() {
+		if req.Content != nil {
+			t.Errorf("send[%d] should not contain history Content; got %+v", i, req.Content)
+		}
+	}
+}
+
+// TestScenario32_HistoryPerTurn_Gemini25NativeAudio_Explicit pins the 2.5
+// Native Audio regression: per-turn replay path is unchanged. Pinned to
+// gemini-2.5-flash-native-audio-latest per fork constraint.
+func TestScenario32_HistoryPerTurn_Gemini25NativeAudio_Explicit(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+
+	priorEvents := []*session.Event{
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("a", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("b", "model")}, Author: "test_agent"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("c", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("d", "model")}, Author: "test_agent"},
+	}
+
+	r, _, _ := setupRunnerWithEvents(t, conn, nil, nil, priorEvents)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	cfg := agent.RunConfig{Model: "gemini-2.5-flash-native-audio-latest"}
+	_, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	sendLog := conn.SendLog()
+	if len(sendLog) != 4 {
+		t.Fatalf("expected 4 per-turn history sends, got %d", len(sendLog))
+	}
+	for i := 0; i < 3; i++ {
+		if sendLog[i].Content == nil {
+			t.Errorf("send[%d] should have Content", i)
+		}
+		if sendLog[i].TurnComplete == nil || *sendLog[i].TurnComplete {
+			t.Errorf("send[%d] should have TurnComplete=&false", i)
+		}
+	}
+	if sendLog[3].Content == nil {
+		t.Error("send[3] should have Content")
+	}
+	if sendLog[3].TurnComplete != nil {
+		t.Errorf("send[3] should have TurnComplete=nil (default true), got %+v", sendLog[3].TurnComplete)
+	}
+}
+
+// TestScenario33_HistoryBatched_Empty_Gemini3 verifies that an empty
+// session history performs neither a batched send nor any per-turn sends.
+func TestScenario33_HistoryBatched_Empty_Gemini3(t *testing.T) {
+	conn := newMockBatchedLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+
+	r, _, _ := setupRunnerWithEvents(t, conn, nil, nil, nil)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	cfg := agent.RunConfig{Model: "gemini-3.1-flash-live-preview"}
+	_, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if got := len(conn.BatchedTurns()); got != 0 {
+		t.Errorf("expected no batched calls for empty history, got %d", got)
+	}
+	if got := len(conn.SendLog()); got != 0 {
+		t.Errorf("expected no per-turn sends for empty history, got %d", got)
+	}
+}
+
+// TestScenario34_HistoryBatched_FunctionCall_Gemini3 verifies that
+// function-call/response turns survive the batching transformation intact.
+func TestScenario34_HistoryBatched_FunctionCall_Gemini3(t *testing.T) {
+	conn := newMockBatchedLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+
+	fcContent := &genai.Content{
+		Role:  "model",
+		Parts: []*genai.Part{{FunctionCall: &genai.FunctionCall{ID: "fc1", Name: "lookup"}}},
+	}
+	frContent := &genai.Content{
+		Role: "user",
+		Parts: []*genai.Part{
+			{FunctionResponse: &genai.FunctionResponse{ID: "fc1", Name: "lookup", Response: map[string]any{"ok": true}}},
+		},
+	}
+
+	priorEvents := []*session.Event{
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("look it up", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: fcContent}, Author: "test_agent"},
+		{LLMResponse: model.LLMResponse{Content: frContent}, Author: "user"},
+	}
+
+	r, _, _ := setupRunnerWithEvents(t, conn, nil, nil, priorEvents)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	cfg := agent.RunConfig{Model: "gemini-3.1-flash-live-preview"}
+	_, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	batched := conn.BatchedTurns()
+	if len(batched) != 1 || len(batched[0]) != 3 {
+		t.Fatalf("expected 1 batched call with 3 turns, got %d call(s) / %v", len(batched), batched)
+	}
+	if batched[0][1].Parts[0].FunctionCall == nil {
+		t.Error("function-call part lost during batching")
+	}
+	if batched[0][2].Parts[0].FunctionResponse == nil {
+		t.Error("function-response part lost during batching")
+	}
+}
+
+// TestScenario35_MidSessionTextRewrite_Gemini3 verifies the text→realtime
+// rewrite chokepoint in sendAndSignal: single-part text user turns are
+// converted to RealtimeInput; mixed media, partial-turn, and multi-part
+// text are passed through unmodified.
+func TestScenario35_MidSessionTextRewrite_Gemini3(t *testing.T) {
+	conn := newMockLiveConnection()
+
+	r, _, _ := setupRunner(t, conn, nil, nil)
+	queue := agent.NewLiveRequestQueue(100)
+
+	falseVal := false
+	_ = queue.Send(context.Background(), &model.LiveRequest{
+		Content: genai.NewContentFromText("hello there", "user"),
+	})
+	_ = queue.Send(context.Background(), &model.LiveRequest{
+		Content: &genai.Content{
+			Role: "user",
+			Parts: []*genai.Part{
+				{Text: "see this"},
+				{InlineData: &genai.Blob{MIMEType: "image/png", Data: []byte{1, 2}}},
+			},
+		},
+	})
+	_ = queue.Send(context.Background(), &model.LiveRequest{
+		Content:      genai.NewContentFromText("partial", "user"),
+		TurnComplete: &falseVal,
+	})
+	// Multi-part text-only turn: must NOT be rewritten — joining parts
+	// would mutate user text. Single-part-only is the strict contract.
+	_ = queue.Send(context.Background(), &model.LiveRequest{
+		Content: &genai.Content{
+			Role: "user",
+			Parts: []*genai.Part{
+				{Text: "  leading"},
+				{Text: "trailing  "},
+			},
+		},
+	})
+	queue.Close()
+
+	cfg := agent.RunConfig{Model: "gemini-3.1-flash-live-preview"}
+	_, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	sendLog := conn.SendLog()
+	if len(sendLog) != 4 {
+		t.Fatalf("expected 4 sends, got %d", len(sendLog))
+	}
+	if sendLog[0].Content != nil {
+		t.Errorf("send[0] should have Content==nil after rewrite, got %+v", sendLog[0].Content)
+	}
+	if sendLog[0].RealtimeInput == nil || sendLog[0].RealtimeInput.Text != "hello there" {
+		t.Errorf("send[0] should have RealtimeInput.Text='hello there', got %+v", sendLog[0].RealtimeInput)
+	}
+	if sendLog[1].Content == nil {
+		t.Error("send[1] (mixed-media) should retain Content")
+	}
+	if sendLog[1].RealtimeInput != nil {
+		t.Errorf("send[1] (mixed-media) should NOT be rewritten, got %+v", sendLog[1].RealtimeInput)
+	}
+	if sendLog[2].Content == nil {
+		t.Error("send[2] (partial turn) should retain Content")
+	}
+	if sendLog[2].TurnComplete == nil || *sendLog[2].TurnComplete {
+		t.Errorf("send[2] should retain TurnComplete=&false, got %+v", sendLog[2].TurnComplete)
+	}
+	if sendLog[3].Content == nil {
+		t.Error("send[3] (multi-part text) should retain Content (no lossy join)")
+	}
+	if sendLog[3].RealtimeInput != nil {
+		t.Errorf("send[3] (multi-part text) should NOT be rewritten, got %+v", sendLog[3].RealtimeInput)
+	}
+}
+
+// TestScenario36_MidSessionTextRewrite_Gemini25NativeAudio_NotApplied
+// pins the 2.5 Native Audio mid-session regression: text turns are NOT
+// rewritten on this model. Pinned to gemini-2.5-flash-native-audio-latest.
+func TestScenario36_MidSessionTextRewrite_Gemini25NativeAudio_NotApplied(t *testing.T) {
+	conn := newMockLiveConnection()
+
+	r, _, _ := setupRunner(t, conn, nil, nil)
+	queue := agent.NewLiveRequestQueue(100)
+
+	_ = queue.Send(context.Background(), &model.LiveRequest{
+		Content: genai.NewContentFromText("hi 2.5", "user"),
+	})
+	queue.Close()
+
+	cfg := agent.RunConfig{Model: "gemini-2.5-flash-native-audio-latest"}
+	_, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	sendLog := conn.SendLog()
+	if len(sendLog) != 1 {
+		t.Fatalf("expected 1 send, got %d", len(sendLog))
+	}
+	if sendLog[0].Content == nil {
+		t.Error("2.5 Native Audio mid-session user turn should retain Content")
+	}
+	if sendLog[0].RealtimeInput != nil {
+		t.Errorf("2.5 Native Audio mid-session turn should NOT be rewritten, got %+v", sendLog[0].RealtimeInput)
+	}
+}
+
+// TestScenario37_HistoryBatched_ExplicitFalse_Gemini3 verifies the explicit
+// override: setting InitialHistoryInClientContent=false on a 3.x model
+// forces the per-turn replay path despite auto-detection.
+func TestScenario37_HistoryBatched_ExplicitFalse_Gemini3(t *testing.T) {
+	conn := newMockBatchedLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+
+	priorEvents := []*session.Event{
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("hi", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("hello", "model")}, Author: "test_agent"},
+	}
+
+	r, _, _ := setupRunnerWithEvents(t, conn, nil, nil, priorEvents)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	cfg := agent.RunConfig{
+		Model:                         "gemini-3.1-flash-live-preview",
+		InitialHistoryInClientContent: ptrBool(false),
+	}
+	_, errs := collectEventsWithConfig(t, r, queue, cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if got := len(conn.BatchedTurns()); got != 0 {
+		t.Errorf("expected no batched calls when InitialHistoryInClientContent=false, got %d", got)
+	}
+	if got := len(conn.SendLog()); got != 2 {
+		t.Errorf("expected 2 per-turn sends after override, got %d", got)
+	}
+}
+
+// TestScenario38_HistoryBatched_ResumeSkipsHistory_Gemini3 is the critical
+// composition test: a 3.x model with a non-empty resumption handle must
+// skip ALL history replay (neither batched nor per-turn). The if handle == ""
+// gate at base_flow_live.go:329 is what guarantees this — the test pins
+// that contract for 3.x specifically.
+func TestScenario38_HistoryBatched_ResumeSkipsHistory_Gemini3(t *testing.T) {
+	// First connection: yields a resumption update then a GoAway, so the
+	// runner saves the handle and reconnects. Reconnect (conn2) must skip
+	// the batched history send because handle != "" on that pass.
+	conn1 := newMockLiveConnection()
+	conn1.recvCh = make(chan *model.LLMResponse, 10)
+
+	conn2 := newMockBatchedLiveConnection()
+	conn2.recvResponses = []*model.LLMResponse{turnCompleteResponse()}
+
+	llm := &resumptionMockLLM{
+		conns: []*mockLiveConnection{conn1, conn2.mockLiveConnection},
+	}
+
+	a, _ := llmagent.New(llmagent.Config{
+		Name:  "test_agent",
+		Model: llm,
+	})
+
+	svc := &mockSessionService{Service: session.InMemoryService()}
+	createResp, _ := svc.Service.Create(context.Background(), &session.CreateRequest{
+		AppName: "test", UserID: "user1", SessionID: "sess1",
+	})
+	if err := svc.Service.AppendEvent(context.Background(), createResp.Session, priorUserEvent("hello")); err != nil {
+		t.Fatal(err)
+	}
+
+	r, _ := New(Config{
+		AppName:        "test",
+		Agent:          a,
+		SessionService: svc,
+	})
+
+	queue := agent.NewLiveRequestQueue(100)
+
+	conn1.recvCh <- &model.LLMResponse{
+		SessionResumptionUpdate: &genai.LiveServerSessionResumptionUpdate{
+			NewHandle: "h-3x-resume",
+			Resumable: true,
+		},
+	}
+	conn1.recvCh <- &model.LLMResponse{GoAway: &genai.LiveServerGoAway{}}
+
+	closerDone := make(chan struct{})
+	go func() {
+		defer close(closerDone)
+		waitForCond(5*time.Second, func() bool { return len(llm.Handles()) >= 2 })
+		queue.Close()
+	}()
+
+	cfg := agent.RunConfig{
+		Model:             "gemini-3.1-flash-live-preview",
+		SessionResumption: &genai.SessionResumptionConfig{},
+	}
+	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+		_ = ev
+		_ = err
+	}
+	<-closerDone
+
+	// resumptionMockLLM hands out conn2.mockLiveConnection on its second
+	// call, so any batched send through conn2's BatchedHistorySender path
+	// happens via the embedded type-assertion in sendHistory. The mock
+	// LLM doesn't dispatch to conn2's embedding, so we instead pin the
+	// invariant via the per-turn SendLog of the underlying mock: on the
+	// 3.x reconnect path, sendHistory is never called (gated by handle).
+	handles := llm.Handles()
+	if len(handles) < 2 {
+		t.Fatalf("expected at least 2 ConnectLive calls, got %d", len(handles))
+	}
+	if handles[1] != "h-3x-resume" {
+		t.Errorf("second connect handle = %q, want %q", handles[1], "h-3x-resume")
+	}
+
+	// conn1: initial fresh connect for 3.x → batched history sent. The
+	// resumptionMockLLM returns conn1 (a plain mockLiveConnection) which
+	// does NOT implement BatchedHistorySender, so sendHistory falls back
+	// to the per-turn loop. We assert that fallback fired exactly once
+	// for the single prior event.
+	if got := len(conn1.SendLog()); got == 0 {
+		t.Error("conn1 (initial fresh connect, handle=\"\") should have replayed history")
+	}
+
+	// conn2: resumed connect for 3.x → handle != "" → sendHistory NOT
+	// called. The bare mockLiveConnection embedded in conn2 should have
+	// no Content sends and the BatchedHistorySender path on
+	// mockBatchedLiveConnection should also be empty.
+	if hasContentSend(conn2.mockLiveConnection.SendLog()) {
+		t.Error("conn2 (resumed with handle=\"h-3x-resume\") must NOT replay history (gate at base_flow_live.go:329)")
+	}
+	if got := len(conn2.BatchedTurns()); got != 0 {
+		t.Errorf("conn2 (resumed) must NOT batched-send history, got %d batched calls", got)
+	}
 }

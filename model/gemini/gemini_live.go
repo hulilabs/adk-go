@@ -68,6 +68,23 @@ func (c *geminiLiveConnection) Send(_ context.Context, req *model.LiveRequest) e
 	}
 }
 
+// SendBatchedHistory sends all turns in a single SendClientContent call with
+// TurnComplete=false. Used at connection setup for gemini-3.x to provide
+// initial context without triggering the 1008 policy violation that occurs
+// when client_content replays are streamed per-turn mid-session.
+func (c *geminiLiveConnection) SendBatchedHistory(_ context.Context, turns []*genai.Content) error {
+	if len(turns) == 0 {
+		return nil
+	}
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	falseVal := false
+	return c.session.SendClientContent(genai.LiveClientContentInput{
+		Turns:        turns,
+		TurnComplete: &falseVal,
+	})
+}
+
 func (c *geminiLiveConnection) Receive(_ context.Context) (*model.LLMResponse, error) {
 	beforeRecv := time.Now()
 	msg, err := c.session.Receive()
@@ -255,4 +272,7 @@ func (m *geminiModel) ConnectLive(ctx context.Context, req *model.LLMRequest) (m
 	return &geminiLiveConnection{session: sess}, nil
 }
 
-var _ model.LiveCapableLLM = (*geminiModel)(nil)
+var (
+	_ model.LiveCapableLLM       = (*geminiModel)(nil)
+	_ model.BatchedHistorySender = (*geminiLiveConnection)(nil)
+)

@@ -98,6 +98,16 @@ type LiveCapableLLM interface {
 	ConnectLive(ctx context.Context, req *LLMRequest) (LiveConnection, error)
 }
 
+// BatchedHistorySender is an optional capability that a LiveConnection may
+// implement to deliver session history as a single batched client-content
+// call rather than streaming per-turn replays. Used to avoid Gemini 3.x's
+// 1008 policy rejection of mid-session client_content replays. Connections
+// that do not implement this interface fall back to the per-turn replay
+// loop in LiveFlow.sendHistory.
+type BatchedHistorySender interface {
+	SendBatchedHistory(ctx context.Context, turns []*genai.Content) error
+}
+
 // LiveRequest discriminates between message types sent to a live connection.
 // Exactly one field should be set per request.
 type LiveRequest struct {

@@ -30,6 +30,7 @@ import (
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/agent"
+	"google.golang.org/adk/internal/llminternal/googlellm"
 	"google.golang.org/adk/internal/toolinternal"
 	"google.golang.org/adk/model"
 	"google.golang.org/adk/session"
@@ -396,7 +397,7 @@ func (lf *LiveFlow) startSessionLoops(
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		lf.senderLoop(cancelCtx, conn, queue, ts, eventCh, turnResetCh)
+		lf.senderLoop(cancelCtx, invCtx, conn, queue, ts, eventCh, turnResetCh)
 		_ = conn.Close()
 	}()
 
@@ -436,6 +437,63 @@ func isGoAway(msg eventOrError) bool {
 	return msg.event != nil && msg.event.GoAway != nil
 }
 
+// liveHistoryMode controls how prior session events are replayed onto a
+// freshly opened live connection. Only consulted on the initial connect
+// (handle == ""); resumed connections trust the server-side replay and skip
+// history altogether — the gate at runSession composes with this routing.
+type liveHistoryMode int
+
+const (
+	liveHistoryModePerTurn liveHistoryMode = iota
+	liveHistoryModeBatched
+)
+
+// chooseLiveHistoryMode resolves the history-replay strategy. RunConfig
+// override wins when set; otherwise gemini-3.x defaults to batched (avoids
+// 1008 policy violation on per-turn replay) and all other models keep the
+// legacy per-turn replay.
+func chooseLiveHistoryMode(rc *agent.RunConfig, modelName string) liveHistoryMode {
+	if rc != nil && rc.InitialHistoryInClientContent != nil {
+		if *rc.InitialHistoryInClientContent {
+			return liveHistoryModeBatched
+		}
+		return liveHistoryModePerTurn
+	}
+	if googlellm.IsGemini3X(modelName) {
+		return liveHistoryModeBatched
+	}
+	return liveHistoryModePerTurn
+}
+
+// resolveLiveModelName mirrors agent/llmagent/llmagent.go: RunConfig.Model
+// (per-run override) wins over the agent's construction-time model name.
+func (lf *LiveFlow) resolveLiveModelName(ctx agent.InvocationContext) string {
+	if rc := ctx.RunConfig(); rc != nil && rc.Model != "" {
+		return rc.Model
+	}
+	if lf.Model != nil {
+		return lf.Model.Name()
+	}
+	return ""
+}
+
+// trackedSendBatchedHistory mirrors trackedSend's timing instrumentation
+// for the batched-history path. Calls liveTimingState.recordSend so that
+// reconnect heuristics observe the batched call as a real send.
+func trackedSendBatchedHistory(
+	ctx context.Context,
+	bs model.BatchedHistorySender,
+	turns []*genai.Content,
+	ts *liveTimingState,
+) error {
+	now := time.Now()
+	if err := bs.SendBatchedHistory(ctx, turns); err != nil {
+		return err
+	}
+	ts.recordSend(now)
+	return nil
+}
+
 func (lf *LiveFlow) sendHistory(
 	cancelCtx context.Context,
 	ctx agent.InvocationContext,
@@ -456,10 +514,23 @@ func (lf *LiveFlow) sendHistory(
 		return nil
 	}
 
-	// Send all history turns with TurnComplete=false so the model absorbs
-	// them as context without responding to each one individually.
-	// Only the last turn is sent with TurnComplete=true to signal
-	// that history replay is complete.
+	modelName := lf.resolveLiveModelName(ctx)
+	mode := chooseLiveHistoryMode(ctx.RunConfig(), modelName)
+
+	// Batched path: deliver history in a single SendClientContent call so
+	// gemini-3.x treats it as initial context rather than a mid-session
+	// replay (avoids 1008 policy violation). Falls back to the per-turn
+	// loop when the connection doesn't implement BatchedHistorySender.
+	if mode == liveHistoryModeBatched {
+		if bs, ok := conn.(model.BatchedHistorySender); ok {
+			return trackedSendBatchedHistory(cancelCtx, bs, turns, ts)
+		}
+	}
+
+	// Per-turn path (2.5 and earlier). Send all history turns with
+	// TurnComplete=false so the model absorbs them as context without
+	// responding to each one individually. Only the last turn is sent
+	// with TurnComplete=true to signal that history replay is complete.
 	falseVal := false
 	for i, content := range turns {
 		isLast := i == len(turns)-1
@@ -475,16 +546,73 @@ func (lf *LiveFlow) sendHistory(
 	return nil
 }
 
+// maybeRewriteForLiveModel converts a single-part text user turn into
+// realtime input on gemini-3.x batched mode to avoid the 1008 policy
+// violation that occurs when client_content is sent mid-session. Anything
+// else is pass-through. Multi-part turns are NOT rewritten — joining
+// would require a separator choice that mutates user text.
+func maybeRewriteForLiveModel(rc *agent.RunConfig, modelName string, req *model.LiveRequest) *model.LiveRequest {
+	if chooseLiveHistoryMode(rc, modelName) != liveHistoryModeBatched {
+		return req
+	}
+	text, ok := extractRewritableText(req)
+	if !ok {
+		return req
+	}
+	return &model.LiveRequest{
+		RealtimeInput: &genai.LiveRealtimeInput{Text: text},
+		EnqueuedAt:    req.EnqueuedAt,
+	}
+}
+
+// extractRewritableText returns the single text payload of a text-only user
+// turn, or ok=false if req is not a candidate for the 3.x rewrite path.
+// Strict: exactly one Part, that Part is text-only and non-empty, no other
+// variant set on the request, and no explicit TurnComplete (realtime input
+// cannot express partial turns). Single-part-only avoids any text-mutating
+// join across parts.
+func extractRewritableText(req *model.LiveRequest) (string, bool) {
+	if req == nil || req.Content == nil {
+		return "", false
+	}
+	if req.RealtimeInput != nil || len(req.ToolResponse) > 0 || req.Close {
+		return "", false
+	}
+	if req.TurnComplete != nil {
+		return "", false
+	}
+	if req.Content.Role != "user" {
+		return "", false
+	}
+	if len(req.Content.Parts) != 1 {
+		return "", false
+	}
+	p := req.Content.Parts[0]
+	if p == nil || p.Text == "" {
+		return "", false
+	}
+	if p.InlineData != nil || p.FileData != nil ||
+		p.FunctionCall != nil || p.FunctionResponse != nil {
+		return "", false
+	}
+	return p.Text, true
+}
+
 // sendAndSignal sends a request on the connection and signals turnResetCh.
-// Returns a non-nil error if the send fails.
-func sendAndSignal(
+// Returns a non-nil error if the send fails. Applies the gemini-3.x text
+// rewrite at this single chokepoint so both the senderLoop and drainQueue
+// paths converge through the same routing decision.
+func (lf *LiveFlow) sendAndSignal(
 	ctx context.Context,
 	conn model.LiveConnection,
 	req *model.LiveRequest,
+	rc *agent.RunConfig,
+	modelName string,
 	ts *liveTimingState,
 	eventCh chan<- eventOrError,
 	turnResetCh chan<- struct{},
 ) error {
+	req = maybeRewriteForLiveModel(rc, modelName, req)
 	if err := trackedSend(ctx, conn, req, ts); err != nil {
 		sendEvent(ctx, eventCh, eventOrError{err: err})
 		return err
@@ -502,20 +630,24 @@ func sendAndSignal(
 // On queue.Done(), it drains any remaining buffered messages before returning.
 func (lf *LiveFlow) senderLoop(
 	ctx context.Context,
+	invCtx agent.InvocationContext,
 	conn model.LiveConnection,
 	queue *agent.LiveRequestQueue,
 	ts *liveTimingState,
 	eventCh chan<- eventOrError,
 	turnResetCh chan<- struct{},
 ) {
+	rc := invCtx.RunConfig()
+	modelName := lf.resolveLiveModelName(invCtx)
+
 	for {
 		select {
 		case req := <-queue.Events():
-			if sendAndSignal(ctx, conn, req, ts, eventCh, turnResetCh) != nil {
+			if lf.sendAndSignal(ctx, conn, req, rc, modelName, ts, eventCh, turnResetCh) != nil {
 				return
 			}
 		case <-queue.Done():
-			lf.drainQueue(ctx, conn, queue, ts, eventCh, turnResetCh)
+			lf.drainQueue(ctx, conn, queue, rc, modelName, ts, eventCh, turnResetCh)
 			return
 		case <-ctx.Done():
 			return
@@ -528,6 +660,8 @@ func (lf *LiveFlow) drainQueue(
 	ctx context.Context,
 	conn model.LiveConnection,
 	queue *agent.LiveRequestQueue,
+	rc *agent.RunConfig,
+	modelName string,
 	ts *liveTimingState,
 	eventCh chan<- eventOrError,
 	turnResetCh chan<- struct{},
@@ -535,7 +669,7 @@ func (lf *LiveFlow) drainQueue(
 	for {
 		select {
 		case req := <-queue.Events():
-			if sendAndSignal(ctx, conn, req, ts, eventCh, turnResetCh) != nil {
+			if lf.sendAndSignal(ctx, conn, req, rc, modelName, ts, eventCh, turnResetCh) != nil {
 				return
 			}
 		default:
