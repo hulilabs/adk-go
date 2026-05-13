@@ -26,7 +26,6 @@ import (
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/agent"
-	"google.golang.org/adk/internal/llminternal"
 	"google.golang.org/adk/internal/telemetry"
 	"google.golang.org/adk/internal/toolinternal"
 	"google.golang.org/adk/model"
@@ -34,13 +33,22 @@ import (
 	"google.golang.org/adk/tool"
 )
 
+// BeforeToolCallback is executed before a tool's Run method.
+type BeforeToolCallback func(ctx tool.Context, tool tool.Tool, args map[string]any) (map[string]any, error)
+
+// AfterToolCallback is executed after a tool's Run method.
+type AfterToolCallback func(ctx tool.Context, tool tool.Tool, args, result map[string]any, err error) (map[string]any, error)
+
+// OnToolErrorCallback is executed when a tool's Run method returns an error.
+type OnToolErrorCallback func(ctx tool.Context, tool tool.Tool, args map[string]any, err error) (map[string]any, error)
+
 // LiveFlow is the core engine for bidirectional live streaming.
 type LiveFlow struct {
 	Model                model.LLM
 	Tools                []tool.Tool
-	BeforeToolCallbacks  []llminternal.BeforeToolCallback
-	AfterToolCallbacks   []llminternal.AfterToolCallback
-	OnToolErrorCallbacks []llminternal.OnToolErrorCallback
+	BeforeToolCallbacks  []BeforeToolCallback
+	AfterToolCallbacks   []AfterToolCallback
+	OnToolErrorCallbacks []OnToolErrorCallback
 	CoalesceWindow       time.Duration
 }
 

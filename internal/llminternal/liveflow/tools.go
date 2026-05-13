@@ -560,7 +560,7 @@ func (lf *LiveFlow) invokeBeforeToolCallbacks(toolCtx tool.Context, t tool.Tool,
 	return nil, nil
 }
 
-func (lf *LiveFlow) invokeAfterToolCallbacks(toolCtx tool.Context, t toolinternal.FunctionTool, fArgs, fResult map[string]any, fErr error) (map[string]any, error) {
+func (lf *LiveFlow) invokeAfterToolCallbacks(toolCtx tool.Context, t tool.Tool, fArgs, fResult map[string]any, fErr error) (map[string]any, error) {
 	for _, callback := range lf.AfterToolCallbacks {
 		result, err := callback(toolCtx, t, fArgs, fResult, fErr)
 		if err != nil {
