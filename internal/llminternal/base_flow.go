@@ -32,6 +32,7 @@ import (
 	"google.golang.org/adk/internal/agent/runconfig"
 	icontext "google.golang.org/adk/internal/context"
 	"google.golang.org/adk/internal/llminternal/googlellm"
+	"google.golang.org/adk/internal/llminternal/liveflow"
 	"google.golang.org/adk/internal/plugininternal/plugincontext"
 	"google.golang.org/adk/internal/telemetry"
 	"google.golang.org/adk/internal/toolinternal"
@@ -50,11 +51,15 @@ type AfterModelCallback func(ctx agent.CallbackContext, llmResponse *model.LLMRe
 
 type OnModelErrorCallback func(ctx agent.CallbackContext, llmRequest *model.LLMRequest, llmResponseError error) (*model.LLMResponse, error)
 
-type BeforeToolCallback func(ctx tool.Context, tool tool.Tool, args map[string]any) (map[string]any, error)
-
-type AfterToolCallback func(ctx tool.Context, tool tool.Tool, args, result map[string]any, err error) (map[string]any, error)
-
-type OnToolErrorCallback func(ctx tool.Context, tool tool.Tool, args map[string]any, err error) (map[string]any, error)
+// Tool-callback types live in the liveflow subpackage so it can stand on its
+// own without importing back into llminternal. The non-Live flow continues to
+// reference them via these aliases for backward compatibility — both names
+// refer to the exact same underlying types.
+type (
+	BeforeToolCallback  = liveflow.BeforeToolCallback
+	AfterToolCallback   = liveflow.AfterToolCallback
+	OnToolErrorCallback = liveflow.OnToolErrorCallback
+)
 
 type Flow struct {
 	Model model.LLM
