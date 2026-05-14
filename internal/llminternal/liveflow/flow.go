@@ -252,6 +252,10 @@ func (lf *LiveFlow) startSessionLoops(
 	toolsFuncMap map[string]toolinternal.FunctionTool,
 	ts *liveTimingState,
 ) (chan eventOrError, *sync.WaitGroup) {
+	// Buffer size 64 is comfortably larger than typical per-turn event
+	// counts (~5–15) so the receiver loop does not block on a slow
+	// consumer during burst traffic, but small enough that genuine
+	// iterator stalls still surface as backpressure within one turn.
 	eventCh := make(chan eventOrError, 64)
 	wg := &sync.WaitGroup{}
 	cs := &coalesceState{

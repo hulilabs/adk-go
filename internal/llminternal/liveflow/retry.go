@@ -30,12 +30,25 @@ import (
 // session via the provided handle (empty string = new session).
 type ConnectFn func(handle string) (model.LiveConnection, error)
 
-// Reconnect retry knobs. Declared as vars (rather than consts) so tests can
-// override them to keep wall time low and make context-cancellation timing
-// deterministic. Production behavior is unchanged.
+// Reconnect retry knobs. Declared as vars (rather than consts) so tests
+// can override them to keep wall time low and make context-cancellation
+// timing deterministic. Production behavior is unchanged.
 var (
-	maxReconnectRetries  = 3
+	// maxReconnectRetries bounds the number of consecutive reconnect
+	// attempts before RunLive surfaces the underlying error. Three is
+	// enough to ride out transient network blips without papering over
+	// a real outage.
+	maxReconnectRetries = 3
+
+	// reconnectBaseBackoff is multiplied by (attempt+1) to produce a
+	// linear backoff sequence: 1s, 2s, 3s. Live sessions are short-lived
+	// enough that exponential backoff would push real reconnect attempts
+	// past the server-side session timeout.
 	reconnectBaseBackoff = time.Second
+
+	// reconnectGoAwaySleep is the brief pause between receiving GoAway
+	// and reopening the connection. Avoids hammering the server during a
+	// planned shutdown while staying well below the resumption-handle TTL.
 	reconnectGoAwaySleep = 500 * time.Millisecond
 )
 
