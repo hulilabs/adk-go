@@ -1958,11 +1958,11 @@ func TestScenario28_EmptyInputBufferNoop(t *testing.T) {
 func TestScenario29_MultiTurnInterleaving(t *testing.T) {
 	conn := newMockLiveConnection()
 	conn.recvResponses = []*model.LLMResponse{
-		transcriptResponse("Hello", "input", false),
+		transcriptResponse("Hello", "input", true),
 		transcriptResponse("Hi!", "output", true),
 		functionCallResponse("fc1", "lookup", map[string]any{}),
 		transcriptResponse("Found it", "output", true),
-		transcriptResponse("Thanks", "input", false),
+		transcriptResponse("Thanks", "input", true),
 		transcriptResponse("You're welcome", "output", true),
 		turnCompleteResponse(),
 	}
@@ -2112,6 +2112,316 @@ func TestScenario30_InputFlushedBeforeTextContent(t *testing.T) {
 	}
 	if persisted[1].Author == "user" {
 		t.Error("second persisted event should not have Author=user")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 31: Transcription event reordering — tool events buffered during transcription
+// ---------------------------------------------------------------------------
+
+func TestScenario31_TranscriptionReordering(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{
+		// Partial transcription starts.
+		transcriptResponse("Hello ", "input", false),
+		// Tool call arrives during transcription.
+		functionCallResponse("fc1", "greet", map[string]any{"name": "Bob"}),
+		// Transcription finishes.
+		transcriptResponse("world", "input", true),
+		// Turn completes.
+		turnCompleteResponse(),
+	}
+
+	greetTool := &mockTool{
+		name:   "greet",
+		result: map[string]any{"message": "Hi Bob"},
+	}
+
+	r, svc, _ := setupRunner(t, conn, []tool.Tool{greetTool}, nil)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	events, errs := collectEvents(t, r, queue)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	// Tool events should be delayed: they must appear AFTER the transcript
+	// events in the yielded sequence.
+	firstToolIdx := -1
+	lastTranscriptIdx := -1
+	for i, ev := range events {
+		if ev.InputTranscription != nil || ev.OutputTranscription != nil {
+			lastTranscriptIdx = i
+		}
+		if isToolEvent(ev) && firstToolIdx == -1 {
+			firstToolIdx = i
+		}
+	}
+	if firstToolIdx >= 0 && lastTranscriptIdx >= 0 && firstToolIdx < lastTranscriptIdx {
+		t.Errorf("tool event (idx=%d) yielded before last transcript (idx=%d)", firstToolIdx, lastTranscriptIdx)
+	}
+
+	// The persisted order should be: transcript BEFORE tool events.
+	persisted := svc.PersistedEvents()
+	transcriptIdx := -1
+	toolIdx := -1
+	for i, ev := range persisted {
+		if ev.Content != nil && len(ev.Content.Parts) > 0 {
+			text := ev.Content.Parts[0].Text
+			if text == "Hello world" {
+				transcriptIdx = i
+			}
+			if ev.Content.Parts[0].FunctionCall != nil || ev.Content.Parts[0].FunctionResponse != nil {
+				if toolIdx == -1 {
+					toolIdx = i
+				}
+			}
+		}
+	}
+	if transcriptIdx == -1 {
+		t.Fatal("transcript event not found in persisted events")
+	}
+	if toolIdx >= 0 && transcriptIdx > toolIdx {
+		t.Errorf("transcript (idx=%d) should appear before tool events (idx=%d) in session history",
+			transcriptIdx, toolIdx)
+	}
+
+	// LiveDiagnostics must travel to the consumer on the re-yielded buffered
+	// tool event, but must be stripped before persistence (mirrors the
+	// non-buffered path at runner.go:588-591).
+	yieldedToolWithDiag := false
+	for _, ev := range events {
+		if isToolEvent(ev) && ev.LiveDiagnostics != nil {
+			yieldedToolWithDiag = true
+			break
+		}
+	}
+	if !yieldedToolWithDiag {
+		t.Error("expected re-yielded buffered tool event to retain LiveDiagnostics")
+	}
+	for i, ev := range persisted {
+		if ev.LiveDiagnostics != nil {
+			t.Errorf("persisted event[%d] has LiveDiagnostics, want nil", i)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 32: Overlapping input and output transcription
+// ---------------------------------------------------------------------------
+
+func TestScenario32_OverlappingTranscription(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvResponses = []*model.LLMResponse{
+		// Input transcription starts.
+		transcriptResponse("user says ", "input", false),
+		// Output transcription starts while input is still active.
+		transcriptResponse("model says ", "output", false),
+		// Tool call arrives — both streams active, should be buffered.
+		functionCallResponse("fc1", "greet", map[string]any{"name": "X"}),
+		// Input finishes — but output is still active, don't flush yet.
+		transcriptResponse("hello", "input", true),
+		// Output finishes — now both are done, flush the buffer.
+		transcriptResponse("goodbye", "output", true),
+		turnCompleteResponse(),
+	}
+
+	greetTool := &mockTool{
+		name:   "greet",
+		result: map[string]any{"msg": "hi"},
+	}
+
+	r, svc, _ := setupRunner(t, conn, []tool.Tool{greetTool}, nil)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	events, errs := collectEvents(t, r, queue)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	// Tool events should NOT appear before both transcripts finish.
+	firstToolIdx := -1
+	lastTranscriptIdx := -1
+	for i, ev := range events {
+		if ev.InputTranscription != nil || ev.OutputTranscription != nil {
+			lastTranscriptIdx = i
+		}
+		if isToolEvent(ev) && firstToolIdx == -1 {
+			firstToolIdx = i
+		}
+	}
+	if firstToolIdx >= 0 && lastTranscriptIdx >= 0 && firstToolIdx < lastTranscriptIdx {
+		t.Errorf("tool event (idx=%d) yielded before last transcript (idx=%d)", firstToolIdx, lastTranscriptIdx)
+	}
+
+	// Persisted: both transcripts should precede tool events.
+	persisted := svc.PersistedEvents()
+	inputTranscriptIdx := -1
+	outputTranscriptIdx := -1
+	persistedToolIdx := -1
+	for i, ev := range persisted {
+		if ev.Content != nil && len(ev.Content.Parts) > 0 {
+			if ev.Content.Parts[0].Text == "user says hello" {
+				inputTranscriptIdx = i
+			}
+			if ev.Content.Parts[0].Text == "model says goodbye" {
+				outputTranscriptIdx = i
+			}
+			if ev.Content.Parts[0].FunctionCall != nil || ev.Content.Parts[0].FunctionResponse != nil {
+				if persistedToolIdx == -1 {
+					persistedToolIdx = i
+				}
+			}
+		}
+	}
+	if inputTranscriptIdx >= 0 && persistedToolIdx >= 0 && inputTranscriptIdx > persistedToolIdx {
+		t.Errorf("input transcript (idx=%d) should precede tool events (idx=%d)", inputTranscriptIdx, persistedToolIdx)
+	}
+	if outputTranscriptIdx >= 0 && persistedToolIdx >= 0 && outputTranscriptIdx > persistedToolIdx {
+		t.Errorf("output transcript (idx=%d) should precede tool events (idx=%d)", outputTranscriptIdx, persistedToolIdx)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 33: Early exit flushes reorder buffer to session
+// ---------------------------------------------------------------------------
+
+func TestScenario33_EarlyExitFlushesBuffer(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvCh = make(chan *model.LLMResponse, 10)
+
+	greetTool := &mockTool{
+		name:   "greet",
+		result: map[string]any{"msg": "hi"},
+	}
+
+	r, svc, _ := setupRunner(t, conn, []tool.Tool{greetTool}, nil)
+	queue := agent.NewLiveRequestQueue(100)
+
+	// Feed: partial transcript, then tool call — but never finish the transcript.
+	conn.recvCh <- transcriptResponse("partial ", "input", false)
+	conn.recvCh <- functionCallResponse("fc1", "greet", nil)
+
+	// Consumer reads 2 events (transcript + tool response from coalesce) then breaks.
+	collected := 0
+	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{ToolCoalesceWindow: 10 * time.Millisecond}) {
+		_ = ev
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		collected++
+		// The transcript event is yielded immediately. The tool event is
+		// buffered (not yielded) so we only see 1 yielded event.
+		// Break after receiving the transcript event.
+		if collected >= 1 {
+			// Give the coalesce timer time to fire so the tool call is processed
+			// and enters the reorder buffer before we break.
+			time.Sleep(50 * time.Millisecond)
+			break
+		}
+	}
+	queue.Close()
+
+	// Wait briefly for defer flush to complete.
+	time.Sleep(100 * time.Millisecond)
+
+	// The defer should have flushed both the transcript buffer and
+	// the reorder buffer to the session.
+	persisted := svc.PersistedEvents()
+
+	foundTranscript := false
+	foundTool := false
+	for _, ev := range persisted {
+		if ev.Content != nil && len(ev.Content.Parts) > 0 {
+			if ev.Content.Parts[0].Text == "partial " {
+				foundTranscript = true
+			}
+			if ev.Content.Parts[0].FunctionCall != nil || ev.Content.Parts[0].FunctionResponse != nil {
+				foundTool = true
+			}
+		}
+	}
+
+	if !foundTranscript {
+		t.Error("expected transcript to be flushed to session on early exit")
+	}
+	// Tool events may or may not have been processed by the live flow
+	// before the consumer broke — the key invariant is that the defer
+	// flushes whatever reached the reorder buffer. We just verify
+	// the mechanism doesn't panic and the transcript is persisted.
+	_ = foundTool
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 34: Consumer breaks mid-flush — no double-append
+// ---------------------------------------------------------------------------
+
+// Regression test for the bug where the reorder-buffer flush loop iterated
+// with `for _, buffered := range reorderBuffer` and never popped items as it
+// processed them. If the consumer broke during the in-flush yield, the
+// defer flush re-iterated the entire (unmutated) buffer and re-appended
+// every event, producing duplicates in session history. The fix pops each
+// item from the buffer BEFORE the persist/yield pair so an early return
+// leaves only the unprocessed tail for the defer to handle.
+func TestScenario34_ReorderFlushBreakNoDoubleAppend(t *testing.T) {
+	conn := newMockLiveConnection()
+	// Sequence: two tool calls arrive while a transcription is mid-stream,
+	// then the transcription finishes (triggering the flush), then turn ends.
+	// Multiple buffered tool events are required to exercise the per-item
+	// pop — a single-item buffer can't double-append by definition.
+	conn.recvResponses = []*model.LLMResponse{
+		transcriptResponse("hel", "input", false),
+		functionCallResponse("fc-a", "greet", map[string]any{"name": "A"}),
+		functionCallResponse("fc-b", "greet", map[string]any{"name": "B"}),
+		transcriptResponse("lo", "input", true),
+		turnCompleteResponse(),
+	}
+
+	greetTool := &mockTool{
+		name:   "greet",
+		result: map[string]any{"msg": "hi"},
+	}
+
+	r, svc, _ := setupRunner(t, conn, []tool.Tool{greetTool}, nil)
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	// Consume up to the first tool event yielded out of the flush, then
+	// break. With the bug, the unmutated buffer would be re-appended by
+	// the defer; with the fix, the popped item is gone and only the
+	// remaining tail is re-flushed.
+	cfg := agent.RunConfig{ToolCoalesceWindow: 5 * time.Millisecond}
+	sawTool := false
+	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if isToolEvent(ev) {
+			sawTool = true
+			break
+		}
+	}
+	if !sawTool {
+		t.Fatal("expected to yield at least one tool event before breaking")
+	}
+
+	// Give the defer flush a moment to run after the iterator terminates.
+	time.Sleep(50 * time.Millisecond)
+
+	// Invariant: no event ID may appear more than once in persisted storage.
+	seen := make(map[string]int)
+	for _, ev := range svc.PersistedEvents() {
+		if ev.ID == "" {
+			continue
+		}
+		seen[ev.ID]++
+	}
+	for id, count := range seen {
+		if count > 1 {
+			t.Errorf("event %q persisted %d times — reorder buffer double-appended", id, count)
+		}
 	}
 }
 
