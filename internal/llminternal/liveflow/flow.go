@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"iter"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	semconv "go.opentelemetry.io/otel/semconv/v1.36.0"
@@ -32,6 +33,28 @@ import (
 	"google.golang.org/adk/session"
 	"google.golang.org/adk/tool"
 )
+
+// sessionShutdown carries per-session shutdown signalling between the
+// runSession-level close call sites and the receiver loop. It is used to
+// suppress *net.OpError{Err: net.ErrClosed} that the genai SDK's blocking
+// Read returns after we locally close the transport during cancellation
+// (closes #43).
+//
+// Lifetime: exactly one runSession invocation. Reconnect cycles MUST
+// construct a fresh instance — reuse across sessions would cause a flag set
+// during a prior cancel to leak into a fresh session's receive path.
+type sessionShutdown struct {
+	localClose atomic.Bool
+}
+
+// closeLocal marks the session as locally-closed and then closes the
+// underlying connection. Every local-intent close in this package MUST
+// route through this helper. A bare conn.Close() inside liveflow/ is a
+// regression of #43 — see TestRunLive_CancelSuppressesLocalNetErrClosed.
+func closeLocal(conn model.LiveConnection, sh *sessionShutdown) {
+	sh.localClose.Store(true)
+	_ = conn.Close()
+}
 
 // BeforeToolCallback is executed before a tool's Run method.
 type BeforeToolCallback func(ctx tool.Context, tool tool.Tool, args map[string]any) (map[string]any, error)
@@ -168,6 +191,7 @@ func (lf *LiveFlow) runSession(
 	yield func(*session.Event, error) bool,
 ) (shouldReconnect, terminated bool) {
 	cancelCtx, cancel := context.WithCancel(ctx)
+	sh := &sessionShutdown{}
 
 	// generate_content covers one WebSocket attempt. On GoAway-driven
 	// reconnects, the outer RunLive loop calls runSession again, producing
@@ -197,14 +221,14 @@ func (lf *LiveFlow) runSession(
 	if handle == "" {
 		if err := lf.sendHistory(cancelCtx, ctx, conn, ts); err != nil {
 			cancel()
-			_ = conn.Close()
+			closeLocal(conn, sh)
 			sessionErr = fmt.Errorf("history handoff failed: %w", err)
 			yield(nil, sessionErr)
 			return false, true
 		}
 	}
 
-	eventCh, wg := lf.startSessionLoops(cancelCtx, ctx, conn, queue, toolsFuncMap, ts)
+	eventCh, wg := lf.startSessionLoops(cancelCtx, ctx, conn, queue, toolsFuncMap, ts, sh)
 
 	for msg := range eventCh {
 		applySessionResumptionUpdate(ctx, msg)
@@ -229,15 +253,23 @@ func (lf *LiveFlow) runSession(
 		}
 		if !yield(msg.event, msg.err) {
 			cancel()
-			_ = conn.Close()
+			closeLocal(conn, sh)
 			wg.Wait()
 			return false, true
 		}
 	}
 
 	cancel()
-	_ = conn.Close()
+	closeLocal(conn, sh)
 	wg.Wait()
+	// On caller-initiated cancellation, yield context.Canceled explicitly so
+	// consumers don't observe a silent iterator close that's indistinguishable
+	// from a clean exit. Mirrors the post-GoAway-sleep branch in RunLive.
+	// Closes #43 AC #1: errors.Is(err, context.Canceled) is true on cancel.
+	if !shouldReconnect && ctx.Err() != nil {
+		yield(nil, ctx.Err())
+		return false, true
+	}
 	return shouldReconnect, false
 }
 
@@ -251,6 +283,7 @@ func (lf *LiveFlow) startSessionLoops(
 	queue *agent.LiveRequestQueue,
 	toolsFuncMap map[string]toolinternal.FunctionTool,
 	ts *liveTimingState,
+	sh *sessionShutdown,
 ) (chan eventOrError, *sync.WaitGroup) {
 	// Buffer size 64 is comfortably larger than typical per-turn event
 	// counts (~5–15) so the receiver loop does not block on a slow
@@ -271,13 +304,13 @@ func (lf *LiveFlow) startSessionLoops(
 	go func() {
 		defer wg.Done()
 		lf.senderLoop(cancelCtx, conn, queue, ts, eventCh, turnResetCh)
-		_ = conn.Close()
+		closeLocal(conn, sh)
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		lf.receiverLoop(cancelCtx, invCtx, conn, queue, cs, toolsFuncMap, ts, eventCh, wg, turnResetCh)
+		lf.receiverLoop(cancelCtx, invCtx, conn, queue, cs, toolsFuncMap, ts, eventCh, wg, turnResetCh, sh)
 	}()
 
 	go func() {

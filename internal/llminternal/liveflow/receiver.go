@@ -16,6 +16,8 @@ package liveflow
 
 import (
 	"context"
+	"errors"
+	"net"
 	"sync"
 
 	"google.golang.org/adk/agent"
@@ -78,6 +80,7 @@ func (lf *LiveFlow) receiverLoop(
 	eventCh chan<- eventOrError,
 	wg *sync.WaitGroup,
 	turnResetCh <-chan struct{},
+	sh *sessionShutdown,
 ) {
 	defer stopCoalesceTimer(cs)
 	recvCh := startReceiveWorker(ctx, conn, cs, wg)
@@ -102,7 +105,7 @@ func (lf *LiveFlow) receiverLoop(
 				guard.reset()
 			default:
 			}
-			if done := lf.handleRecv(ctx, invCtx, conn, queue, cs, toolsFuncMap, ts, r, eventCh, guard); done {
+			if done := lf.handleRecv(ctx, invCtx, conn, queue, cs, toolsFuncMap, ts, r, eventCh, guard, sh); done {
 				return
 			}
 		case <-cs.flushCh:
@@ -127,9 +130,24 @@ func (lf *LiveFlow) handleRecv(
 	r recvResult,
 	eventCh chan<- eventOrError,
 	guard *turnCycleGuard,
+	sh *sessionShutdown,
 ) bool {
 	if r.err != nil {
 		if ctx.Err() != nil {
+			return true
+		}
+		// Suppress net.ErrClosed when we initiated the close locally
+		// (cancellation, yield-false, history-handoff failure, or normal
+		// end-of-session). The genai SDK's blocking Read ignores ctx, so a
+		// Read parked at close time returns *net.OpError{Err: net.ErrClosed}
+		// after our local Close. That's a shutdown artifact, not a
+		// peer-initiated transport error. The localClose flag is set
+		// synchronously before conn.Close() in closeLocal, so by the time
+		// Receive returns it is observable here — closing the race window
+		// where ctx.Done() propagation has not yet reached this frame.
+		// Peer-initiated net.ErrClosed (no local close) still surfaces.
+		// See issue #43.
+		if sh.localClose.Load() && errors.Is(r.err, net.ErrClosed) {
 			return true
 		}
 		// An EOF observed during a client-initiated shutdown (queue closed,
