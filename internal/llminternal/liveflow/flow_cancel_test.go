@@ -36,6 +36,12 @@ import (
 type cancelTrackingConn struct {
 	closed   atomic.Bool
 	recvGate chan struct{}
+	// activeCh is signalled once, when Receive first parks. Tests use it to
+	// fire cancel exactly when the receiver is blocked, exercising the
+	// cancel-vs-local-close race deterministically without a hardcoded timer.
+	// Buffered + non-blocking send so unused reads (e.g. the jittered
+	// race-under-load test) never stall the connection.
+	activeCh chan struct{}
 	// returnedErr is the error Receive yields once unblocked. Defaults to
 	// the net.OpError wrapping net.ErrClosed that the real SDK produces.
 	returnedErr error
@@ -44,6 +50,7 @@ type cancelTrackingConn struct {
 func newCancelTrackingConn() *cancelTrackingConn {
 	return &cancelTrackingConn{
 		recvGate:    make(chan struct{}),
+		activeCh:    make(chan struct{}, 1),
 		returnedErr: &net.OpError{Op: "read", Net: "tcp", Err: net.ErrClosed},
 	}
 }
@@ -53,6 +60,12 @@ func (c *cancelTrackingConn) Send(_ context.Context, _ *model.LiveRequest) error
 }
 
 func (c *cancelTrackingConn) Receive(ctx context.Context) (*model.LLMResponse, error) {
+	// Announce that we're parked. Non-blocking so a test that never reads
+	// activeCh (or a second Receive call) doesn't deadlock the worker.
+	select {
+	case c.activeCh <- struct{}{}:
+	default:
+	}
 	select {
 	case <-c.recvGate:
 		return nil, c.returnedErr
@@ -94,9 +107,12 @@ func TestRunLive_CancelSuppressesLocalNetErrClosed(t *testing.T) {
 
 	conn := newCancelTrackingConn()
 	connectFn := func(_ string) (model.LiveConnection, error) {
-		// Schedule a cancel a hair after the receiver is parked so the
-		// race is real: ctx.Done() and the local Close fire concurrently.
-		time.AfterFunc(20*time.Millisecond, cancel)
+		// Fire cancel the moment Receive parks, so ctx.Done() propagation
+		// and the local Close race deterministically — no hardcoded timer.
+		go func() {
+			<-conn.activeCh
+			cancel()
+		}()
 		return conn, nil
 	}
 
