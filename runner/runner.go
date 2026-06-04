@@ -174,7 +174,13 @@ func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg *genai.C
 		ctx = runconfig.ToContext(ctx, &runconfig.RunConfig{
 			StreamingMode: runconfig.StreamingMode(cfg.StreamingMode),
 		})
-		ctx = plugininternal.ToContext(ctx, r.pluginManager)
+		// Only overwrite the plugin manager in context if this runner has its
+		// own plugins. Otherwise, inherit the parent's plugin manager (e.g.
+		// when a sub-runner is created by agenttool without PluginConfig) so
+		// model/tool/agent callbacks still propagate to the parent's plugins.
+		if r.pluginManager != nil && r.pluginManager.HasPlugins() {
+			ctx = plugininternal.ToContext(ctx, r.pluginManager)
+		}
 
 		var artifacts agent.Artifacts
 		if r.artifactService != nil {
@@ -365,7 +371,12 @@ func (r *Runner) RunLive(
 		ctx = runconfig.ToContext(ctx, &runconfig.RunConfig{
 			StreamingMode: runconfig.StreamingMode(cfg.StreamingMode),
 		})
-		ctx = plugininternal.ToContext(ctx, r.pluginManager)
+		// Same guard as Run(): a plugin-less (sub-)runner must inherit the
+		// parent's plugin manager from context instead of clobbering it with
+		// its own empty one, so model/tool/agent callbacks still propagate.
+		if r.pluginManager != nil && r.pluginManager.HasPlugins() {
+			ctx = plugininternal.ToContext(ctx, r.pluginManager)
+		}
 
 		artifacts, memoryImpl := r.resolveServices(storedSession)
 
