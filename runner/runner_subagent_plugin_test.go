@@ -30,6 +30,7 @@ import (
 
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/agent/llmagent"
+	"google.golang.org/adk/internal/plugininternal"
 	"google.golang.org/adk/model"
 	"google.golang.org/adk/plugin"
 	"google.golang.org/adk/runner"
@@ -141,12 +142,14 @@ type callCounter struct {
 	beforeRun   int
 	afterRun    int
 	beforeAgent map[string]int
+	afterAgent  map[string]int
 	afterModel  map[string]int
 }
 
 func newCallCounter() *callCounter {
 	return &callCounter{
 		beforeAgent: make(map[string]int),
+		afterAgent:  make(map[string]int),
 		afterModel:  make(map[string]int),
 	}
 }
@@ -172,6 +175,12 @@ func (c *callCounter) plugin(t *testing.T) *plugin.Plugin {
 			c.mu.Unlock()
 			return nil, nil
 		},
+		AfterAgentCallback: func(ctx agent.CallbackContext) (*genai.Content, error) {
+			c.mu.Lock()
+			c.afterAgent[ctx.AgentName()]++
+			c.mu.Unlock()
+			return nil, nil
+		},
 		AfterModelCallback: func(ctx agent.CallbackContext, _ *model.LLMResponse, _ error) (*model.LLMResponse, error) {
 			c.mu.Lock()
 			c.afterModel[ctx.AgentName()]++
@@ -189,6 +198,17 @@ func (c *callCounter) snapshot() (beforeRun, afterRun, subBeforeAgent, subAfterM
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.beforeRun, c.afterRun, c.beforeAgent["sub_agent"], c.afterModel["sub_agent"]
+}
+
+// agentCounts returns the beforeAgent/afterAgent counts recorded for the given
+// agent name. Used by tests that exercise an agent other than "sub_agent".
+// Note: afterModel is deliberately not exposed here because the live flow does
+// not invoke AfterModelCallback — only the agent-level callbacks fire in live
+// mode, so they are the reliable inheritance signal for a RunLive-only agent.
+func (c *callCounter) agentCounts(agentName string) (beforeAgent, afterAgent int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.beforeAgent[agentName], c.afterAgent[agentName]
 }
 
 // newSubAgent builds a plugin-less sub-agent (wrapped by agenttool with an empty
@@ -301,24 +321,110 @@ func TestSubRunnerInheritsParentPlugins(t *testing.T) {
 
 // assertInheritance verifies both halves of the fix:
 //
-//	(a) the sub-agent's model/agent callbacks fired (afterModel/beforeAgent >= 1)
-//	    — proves the plugin-less sub-runner inherited the parent's manager;
+//	(a) the sub-agent's model/agent callbacks fired EXACTLY once
+//	    (afterModel/beforeAgent == 1) — proves the plugin-less sub-runner
+//	    inherited the parent's manager AND did not double-fire the inherited
+//	    callbacks. The sub-agent's model is scripted for exactly one turn, so
+//	    any count != 1 signals a regression.
 //	(b) run-scoped callbacks fired EXACTLY once (BeforeRun/AfterRun == 1)
 //	    — proves the sub-runner did not double-fire them with its own manager.
 func assertInheritance(t *testing.T, counter *callCounter) {
 	t.Helper()
 	beforeRun, afterRun, subBeforeAgent, subAfterModel := counter.snapshot()
 
-	if subAfterModel < 1 {
-		t.Errorf("sub-agent afterModel count = %d, want >= 1 (inherited plugin manager)", subAfterModel)
+	if subAfterModel != 1 {
+		t.Errorf("sub-agent afterModel = %d, want exactly 1", subAfterModel)
 	}
-	if subBeforeAgent < 1 {
-		t.Errorf("sub-agent beforeAgent count = %d, want >= 1 (inherited plugin manager)", subBeforeAgent)
+	if subBeforeAgent != 1 {
+		t.Errorf("sub-agent beforeAgent = %d, want exactly 1", subBeforeAgent)
 	}
 	if beforeRun != 1 {
 		t.Errorf("BeforeRun count = %d, want exactly 1 (no double-fire)", beforeRun)
 	}
 	if afterRun != 1 {
 		t.Errorf("AfterRun count = %d, want exactly 1 (no double-fire)", afterRun)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression test: a plugin-less runner driven via RunLive must inherit the
+// plugin manager seeded in its context instead of clobbering it.
+//
+// TestSubRunnerInheritsParentPlugins drives the parent via RunLive, but
+// agenttool delegates the sub-runner via r.Run, so the RunLive inheritance
+// guard in runner.go is never exercised by that test. This test calls RunLive
+// directly on a plugin-less runner whose context already carries a parent
+// plugin manager, proving the guard preserves the inherited manager. It fails
+// if the guard is removed (unconditional overwrite) because the seeded plugin's
+// callbacks would then never fire.
+//
+// We assert on the agent-level callbacks (beforeAgent/afterAgent) rather than
+// afterModel: the live flow does not invoke AfterModelCallback, so only the
+// agent-level callbacks are a reliable inheritance signal in pure RunLive mode.
+// ---------------------------------------------------------------------------
+
+func TestRunLiveInheritsContextPluginManager(t *testing.T) {
+	counter := newCallCounter()
+
+	parentMgr, err := plugininternal.NewPluginManager(plugininternal.PluginConfig{
+		Plugins: []*plugin.Plugin{counter.plugin(t)},
+	})
+	if err != nil {
+		t.Fatalf("plugininternal.NewPluginManager: %v", err)
+	}
+	seededCtx := plugininternal.ToContext(context.Background(), parentMgr)
+
+	conn := &liveConn{responses: []*model.LLMResponse{
+		textLLMResponse("live done"),
+		{TurnComplete: true},
+	}}
+	liveModel := &liveLLM{name: "live-model", conn: conn}
+	liveAgent, err := llmagent.New(llmagent.Config{
+		Name:        "live_agent",
+		Description: "a plugin-less agent driven directly via RunLive",
+		Model:       liveModel,
+	})
+	if err != nil {
+		t.Fatalf("llmagent.New(live): %v", err)
+	}
+
+	svc := session.InMemoryService()
+	if _, err := svc.Create(context.Background(), &session.CreateRequest{
+		AppName:   "test",
+		UserID:    "user1",
+		SessionID: "sess1",
+	}); err != nil {
+		t.Fatalf("session create: %v", err)
+	}
+
+	// Empty PluginConfig: this runner owns no plugins, so its guard must leave
+	// the context-seeded parent manager in place.
+	r, err := runner.New(runner.Config{
+		AppName:        "test",
+		Agent:          liveAgent,
+		SessionService: svc,
+		PluginConfig:   runner.PluginConfig{},
+	})
+	if err != nil {
+		t.Fatalf("runner.New: %v", err)
+	}
+
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close()
+
+	for _, err := range r.RunLive(
+		seededCtx, "user1", "sess1", queue, agent.RunConfig{},
+	) {
+		if err != nil && err != io.EOF {
+			t.Fatalf("RunLive yielded error: %v", err)
+		}
+	}
+
+	beforeAgent, afterAgent := counter.agentCounts("live_agent")
+	if beforeAgent != 1 {
+		t.Errorf("seeded plugin beforeAgent = %d, want exactly 1 (RunLive inherited context manager)", beforeAgent)
+	}
+	if afterAgent != 1 {
+		t.Errorf("seeded plugin afterAgent = %d, want exactly 1 (RunLive inherited context manager)", afterAgent)
 	}
 }

@@ -178,6 +178,9 @@ func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg *genai.C
 		// own plugins. Otherwise, inherit the parent's plugin manager (e.g.
 		// when a sub-runner is created by agenttool without PluginConfig) so
 		// model/tool/agent callbacks still propagate to the parent's plugins.
+		// Limitation: a runner with no plugins of its own always inherits the
+		// context manager; there is currently no opt-out for forced isolation,
+		// so a runner that must not inherit has to configure its own plugin set.
 		if r.pluginManager != nil && r.pluginManager.HasPlugins() {
 			ctx = plugininternal.ToContext(ctx, r.pluginManager)
 		}
