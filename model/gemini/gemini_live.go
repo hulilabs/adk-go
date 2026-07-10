@@ -54,17 +54,29 @@ func (c *geminiLiveConnection) Send(_ context.Context, req *model.LiveRequest) e
 			ActivityEnd:    req.RealtimeInput.ActivityEnd,
 			AudioStreamEnd: req.RealtimeInput.AudioStreamEnd,
 		})
-	case req.Content != nil:
-		tc := true // default: model responds after this content
-		if req.TurnComplete != nil {
-			tc = *req.TurnComplete
-		}
-		return c.session.SendClientContent(genai.LiveClientContentInput{
-			Turns:        []*genai.Content{req.Content},
-			TurnComplete: &tc,
-		})
+	case len(req.Contents) > 0, req.Content != nil:
+		return c.session.SendClientContent(clientContentInput(req))
 	default:
 		return fmt.Errorf("empty LiveRequest: at least one field must be set")
+	}
+}
+
+// clientContentInput translates a content-bearing LiveRequest into the SDK's
+// client-content payload. Contents (a batched turn slice, e.g. history
+// replay) takes precedence over the single-turn Content. A nil TurnComplete
+// defaults to true — the model responds after this content.
+func clientContentInput(req *model.LiveRequest) genai.LiveClientContentInput {
+	tc := true
+	if req.TurnComplete != nil {
+		tc = *req.TurnComplete
+	}
+	turns := req.Contents
+	if len(turns) == 0 {
+		turns = []*genai.Content{req.Content}
+	}
+	return genai.LiveClientContentInput{
+		Turns:        turns,
+		TurnComplete: &tc,
 	}
 }
 

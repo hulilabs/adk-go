@@ -99,15 +99,22 @@ type LiveCapableLLM interface {
 }
 
 // LiveRequest discriminates between message types sent to a live connection.
-// Exactly one field should be set per request.
+// Exactly one payload field (Content, Contents, RealtimeInput, ToolResponse,
+// Close) should be set per request.
 type LiveRequest struct {
-	Content       *genai.Content
+	Content *genai.Content
+	// Contents carries a batch of turns delivered in a single client-content
+	// message — used to replay conversation history on fresh connects.
+	// Mutually exclusive with Content; if both are set, Contents wins.
+	// Unrelated to LLMRequest.Contents, which is the unary-request history.
+	Contents      []*genai.Content
 	RealtimeInput *genai.LiveRealtimeInput
 	ToolResponse  []*genai.FunctionResponse
 	Close         bool
-	// TurnComplete controls whether the model should respond after this content.
-	// nil defaults to true (backwards compatible). Set to false when sending
-	// history turns that the model should absorb without responding.
+	// TurnComplete controls whether the model should respond after this
+	// content. nil defaults to true (backwards compatible). History replay
+	// sets it explicitly: true only when the last replayed turn is an
+	// unanswered user turn, so a model-final history is absorbed silently.
 	TurnComplete *bool
 
 	// EnqueuedAt is stamped when the request enters the LiveRequestQueue.
