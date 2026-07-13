@@ -307,7 +307,7 @@ func TestSubRunnerInheritsParentPlugins(t *testing.T) {
 		queue := agent.NewLiveRequestQueue(100)
 		queue.Close()
 
-		for _, err := range r.RunLive(
+		for _, err := range r.RunLiveQueue(
 			context.Background(), "user1", "sess1", queue, agent.RunConfig{},
 		) {
 			if err != nil && err != io.EOF {
@@ -412,7 +412,7 @@ func TestRunLiveInheritsContextPluginManager(t *testing.T) {
 	queue := agent.NewLiveRequestQueue(100)
 	queue.Close()
 
-	for _, err := range r.RunLive(
+	for _, err := range r.RunLiveQueue(
 		seededCtx, "user1", "sess1", queue, agent.RunConfig{},
 	) {
 		if err != nil && err != io.EOF {
@@ -426,5 +426,174 @@ func TestRunLiveInheritsContextPluginManager(t *testing.T) {
 	}
 	if afterAgent != 1 {
 		t.Errorf("seeded plugin afterAgent = %d, want exactly 1 (RunLive inherited context manager)", afterAgent)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression test: the upstream-API RunLive entry point (agent.LiveSession
+// signature, added in v1.5.0) must apply the same plugin-manager inheritance
+// guard as Run and RunLiveQueue.
+//
+// The upstream live engine cannot run offline (it requires a *genai.Client
+// live connection), so instead of driving it end-to-end this test uses a fake
+// live agent that captures the plugin manager present in the invocation
+// context RunLive hands to the agent. A plugin-less runner must leave the
+// context-seeded parent manager in place; without the guard, the runner's own
+// empty manager replaces it and parent plugin callbacks stop propagating.
+// ---------------------------------------------------------------------------
+
+// noopLiveSession is a no-op agent.LiveSession returned by captureLiveAgent.
+type noopLiveSession struct{}
+
+func (s *noopLiveSession) Send(agent.LiveRequest) error { return nil }
+func (s *noopLiveSession) Close() error                 { return nil }
+
+// captureLiveAgent embeds a plain agent.Agent (the interface has an unexported
+// method, so it cannot be implemented directly by a test type) and adds the
+// RunLive method the runner's upstream live entry point type-asserts for,
+// recording the plugin manager found in the invocation context.
+type captureLiveAgent struct {
+	agent.Agent
+	mu       sync.Mutex
+	captured *plugininternal.PluginManager
+}
+
+func (a *captureLiveAgent) RunLive(ctx agent.InvocationContext) (agent.LiveSession, iter.Seq2[*session.Event, error], error) {
+	a.mu.Lock()
+	a.captured = plugininternal.FromContext(ctx)
+	a.mu.Unlock()
+	return &noopLiveSession{}, func(func(*session.Event, error) bool) {}, nil
+}
+
+func (a *captureLiveAgent) capturedManager() *plugininternal.PluginManager {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.captured
+}
+
+func TestUpstreamRunLiveInheritsContextPluginManager(t *testing.T) {
+	counter := newCallCounter()
+	parentMgr, err := plugininternal.NewPluginManager(plugininternal.PluginConfig{
+		Plugins: []*plugin.Plugin{counter.plugin(t)},
+	})
+	if err != nil {
+		t.Fatalf("plugininternal.NewPluginManager: %v", err)
+	}
+	seededCtx := plugininternal.ToContext(context.Background(), parentMgr)
+
+	inner, err := agent.New(agent.Config{
+		Name:        "capture_agent",
+		Description: "captures the context plugin manager from RunLive",
+		Run: func(agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			return func(func(*session.Event, error) bool) {}
+		},
+	})
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	capture := &captureLiveAgent{Agent: inner}
+
+	svc := session.InMemoryService()
+	if _, err := svc.Create(context.Background(), &session.CreateRequest{
+		AppName:   "test",
+		UserID:    "user1",
+		SessionID: "sess1",
+	}); err != nil {
+		t.Fatalf("session create: %v", err)
+	}
+
+	// Empty PluginConfig: this runner owns no plugins, so its guard must leave
+	// the context-seeded parent manager in place.
+	r, err := runner.New(runner.Config{
+		AppName:        "test",
+		Agent:          capture,
+		SessionService: svc,
+		PluginConfig:   runner.PluginConfig{},
+	})
+	if err != nil {
+		t.Fatalf("runner.New: %v", err)
+	}
+
+	sess, events, err := r.RunLive(seededCtx, "user1", "sess1", agent.LiveRunConfig{})
+	if err != nil {
+		t.Fatalf("RunLive: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+	for _, err := range events {
+		if err != nil {
+			t.Fatalf("RunLive yielded error: %v", err)
+		}
+	}
+
+	if got := capture.capturedManager(); got != parentMgr {
+		t.Errorf("RunLive installed plugin manager %p in the invocation context, want the inherited parent manager %p", got, parentMgr)
+	}
+}
+
+// TestUpstreamRunLiveInstallsOwnPluginManager is the positive counterpart of
+// TestUpstreamRunLiveInheritsContextPluginManager: a runner that owns plugins
+// must install its own manager over a context-seeded parent one. Without this
+// case, a guard regressed to never installing would still pass the suite.
+func TestUpstreamRunLiveInstallsOwnPluginManager(t *testing.T) {
+	parentCounter := newCallCounter()
+	parentMgr, err := plugininternal.NewPluginManager(plugininternal.PluginConfig{
+		Plugins: []*plugin.Plugin{parentCounter.plugin(t)},
+	})
+	if err != nil {
+		t.Fatalf("plugininternal.NewPluginManager: %v", err)
+	}
+	seededCtx := plugininternal.ToContext(context.Background(), parentMgr)
+
+	inner, err := agent.New(agent.Config{
+		Name:        "capture_agent",
+		Description: "captures the context plugin manager from RunLive",
+		Run: func(agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			return func(func(*session.Event, error) bool) {}
+		},
+	})
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	capture := &captureLiveAgent{Agent: inner}
+
+	svc := session.InMemoryService()
+	if _, err := svc.Create(context.Background(), &session.CreateRequest{
+		AppName:   "test",
+		UserID:    "user1",
+		SessionID: "sess1",
+	}); err != nil {
+		t.Fatalf("session create: %v", err)
+	}
+
+	// This runner owns a plugin, so the HasPlugins guard must fire and replace
+	// the seeded parent manager with the runner's own.
+	ownCounter := newCallCounter()
+	r, err := runner.New(runner.Config{
+		AppName:        "test",
+		Agent:          capture,
+		SessionService: svc,
+		PluginConfig:   runner.PluginConfig{Plugins: []*plugin.Plugin{ownCounter.plugin(t)}},
+	})
+	if err != nil {
+		t.Fatalf("runner.New: %v", err)
+	}
+
+	sess, events, err := r.RunLive(seededCtx, "user1", "sess1", agent.LiveRunConfig{})
+	if err != nil {
+		t.Fatalf("RunLive: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+	for _, err := range events {
+		if err != nil {
+			t.Fatalf("RunLive yielded error: %v", err)
+		}
+	}
+
+	got := capture.capturedManager()
+	if got == parentMgr {
+		t.Errorf("RunLive left the seeded parent manager %p in the invocation context; want the runner's own manager (guard must install when the runner has plugins)", parentMgr)
+	}
+	if !got.HasPlugins() {
+		t.Errorf("RunLive installed a plugin manager with no plugins in the invocation context; want the runner's own populated manager")
 	}
 }

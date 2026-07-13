@@ -40,7 +40,7 @@ import (
 func main() {
 	ctx := context.Background()
 
-	model, err := gemini.NewModel(ctx, "gemini-2.5-flash", &genai.ClientConfig{
+	model, err := gemini.NewModel(ctx, "gemini-3.1-flash-lite", &genai.ClientConfig{
 		APIKey: os.Getenv("GOOGLE_API_KEY"),
 	})
 	if err != nil {
@@ -170,7 +170,7 @@ func createPreviousSessionWithHistory(
 	}
 
 	for _, e := range events {
-		event := session.NewEvent("previous-session")
+		event := session.NewEventWithContext(ctx, "previous-session")
 		event.Author = e.author
 		event.LLMResponse = model.LLMResponse{
 			Content: genai.NewContentFromText(e.content, genai.Role(e.author)),

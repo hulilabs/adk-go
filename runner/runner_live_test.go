@@ -304,7 +304,7 @@ func collectEvents(t *testing.T, r *Runner, queue *agent.LiveRequestQueue) ([]*s
 	t.Helper()
 	var events []*session.Event
 	var errs []error
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -598,7 +598,7 @@ func TestScenario3_InFlightToolCancellation(t *testing.T) {
 	start := time.Now()
 	cfg := agent.RunConfig{ToolCoalesceWindow: 10 * time.Millisecond}
 	var events []*session.Event
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, cfg) {
 		if err != nil {
 			break
 		}
@@ -1100,7 +1100,7 @@ func TestScenario10_ToolCallCoalescing(t *testing.T) {
 
 	cfg := agent.RunConfig{ToolCoalesceWindow: 100 * time.Millisecond}
 	var events []*session.Event
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, cfg) {
 		if err != nil {
 			break
 		}
@@ -1186,7 +1186,7 @@ func TestScenario11_ModelSpeakingStateTransitions(t *testing.T) {
 		queue.Close()
 	}()
 
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
 		_ = ev
 		_ = err
 	}
@@ -1391,7 +1391,7 @@ func TestScenario15_DeferFlushOnConsumerBreak(t *testing.T) {
 
 	// Consumer collects 2 events then breaks (simulates user pressing Stop).
 	collected := 0
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
 		_ = ev
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1431,7 +1431,7 @@ func TestRunLive_LiveDiagnostics_NotLeakedToSession(t *testing.T) {
 	queue.Close()
 
 	var yieldedEvents []*session.Event
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1729,7 +1729,7 @@ func TestScenario21_LateOrphanFlushAfterTurnComplete(t *testing.T) {
 
 	cfg := agent.RunConfig{ToolCoalesceWindow: 10 * time.Millisecond}
 	var events []*session.Event
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, cfg) {
 		if err != nil {
 			break
 		}
@@ -2420,7 +2420,7 @@ func TestScenario33_EarlyExitFlushesBuffer(t *testing.T) {
 
 	// Consumer reads 2 events (transcript + tool response from coalesce) then breaks.
 	collected := 0
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{ToolCoalesceWindow: 10 * time.Millisecond}) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{ToolCoalesceWindow: 10 * time.Millisecond}) {
 		_ = ev
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -2508,7 +2508,7 @@ func TestScenario34_ReorderFlushBreakNoDoubleAppend(t *testing.T) {
 	// remaining tail is re-flushed.
 	cfg := agent.RunConfig{ToolCoalesceWindow: 5 * time.Millisecond}
 	sawTool := false
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, cfg) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -2791,7 +2791,7 @@ func TestScenario_NonThoughtCancelledThoughtOnlyDoesNotReset(t *testing.T) {
 
 	cfg := agent.RunConfig{ToolCoalesceWindow: 500 * time.Millisecond}
 	var events []*session.Event
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, cfg) {
 		if err != nil {
 			break
 		}
@@ -2984,7 +2984,7 @@ func TestScenario16_GoAwayReconnectionWithHandle(t *testing.T) {
 	}()
 
 	var events []*session.Event
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{
 		SessionResumption: &genai.SessionResumptionConfig{},
 	}) {
 		if err != nil {
@@ -3110,7 +3110,7 @@ func TestScenario17_NonResumableClearsHandle(t *testing.T) {
 		queue.Close()
 	}()
 
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{
 		SessionResumption: &genai.SessionResumptionConfig{},
 	}) {
 		_ = ev
@@ -3286,7 +3286,7 @@ func TestScenarioResumeUsesTransparentTrue(t *testing.T) {
 		queue.Close()
 	}()
 
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{
 		// Caller opts into session resumption with Transparent=false; the
 		// resume path overwrites this on the second connect.
 		SessionResumption: &genai.SessionResumptionConfig{Transparent: false},
@@ -3374,7 +3374,7 @@ func TestScenarioConnectionEOFWithHandleReconnects(t *testing.T) {
 	}()
 
 	var yieldedErr error
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{
 		SessionResumption: &genai.SessionResumptionConfig{},
 	}) {
 		_ = ev
@@ -3453,7 +3453,7 @@ func TestScenarioConnectionEOFWithoutHandleYieldsError(t *testing.T) {
 	}()
 
 	var yieldedErrs []error
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{
 		SessionResumption: &genai.SessionResumptionConfig{},
 	}) {
 		_ = ev

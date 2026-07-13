@@ -71,7 +71,7 @@ func main() {
 		ResponseModalities:       []genai.Modality{genai.ModalityAudio},
 		OutputAudioTranscription: true,
 	}
-	for ev, err := range r.RunLive(ctx, "user1", "sess1", queue, cfg) {
+	for ev, err := range r.RunLiveQueue(ctx, "user1", "sess1", queue, cfg) {
 		if err != nil {
 			fmt.Printf("[error] %v\n", err)
 			break
