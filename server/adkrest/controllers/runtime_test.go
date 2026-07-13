@@ -16,6 +16,7 @@ package controllers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"iter"
@@ -77,7 +78,7 @@ func TestNewRuntimeAPIController_PluginsAssignment(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			controller := NewRuntimeAPIController(nil, nil, nil, nil, 10*time.Second, runner.PluginConfig{
 				Plugins: tt.plugins,
-			})
+			}, false)
 
 			if controller == nil {
 				t.Fatal("NewRuntimeAPIController returned nil")
@@ -116,7 +117,7 @@ func testAgent(results []testAgentResult) func(ctx agent.InvocationContext) iter
 }
 
 func makeEvent(id, author, text string) *session.Event {
-	e := session.NewEvent(id)
+	e := session.NewEventWithContext(context.Background(), id)
 	e.Author = author
 	e.LLMResponse.Content = &genai.Content{
 		Parts: []*genai.Part{{Text: text}},
@@ -201,6 +202,7 @@ func TestRunSSEHandler(t *testing.T) {
 				nil,
 				10*time.Second,
 				runner.PluginConfig{},
+				false,
 			)
 
 			// Create request

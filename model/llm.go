@@ -42,13 +42,15 @@ type LLMRequest struct {
 // LLMResponse is the raw LLM response.
 // It provides the first candidate response from the model if available.
 type LLMResponse struct {
-	Content           *genai.Content
-	CitationMetadata  *genai.CitationMetadata
-	GroundingMetadata *genai.GroundingMetadata
-	UsageMetadata     *genai.GenerateContentResponseUsageMetadata
-	CustomMetadata    map[string]any
-	LogprobsResult    *genai.LogprobsResult
-	ModelVersion      string
+	Content             *genai.Content
+	CitationMetadata    *genai.CitationMetadata
+	GroundingMetadata   *genai.GroundingMetadata
+	UsageMetadata       *genai.GenerateContentResponseUsageMetadata
+	CustomMetadata      map[string]any
+	LogprobsResult      *genai.LogprobsResult
+	InputTranscription  *genai.Transcription
+	OutputTranscription *genai.Transcription
+	ModelVersion        string
 	// Partial indicates whether the content is part of a unfinished content stream.
 	// Only used for streaming mode and when the content is plain text.
 	// The Runner fully processes only the final non-partial event, partial
@@ -61,11 +63,8 @@ type LLMResponse struct {
 	// Usually it is due to user interruption during a bidi streaming.
 	Interrupted bool
 
-	// Live-only: transcription of user audio input / model audio output.
-	// Populated by the model connector (e.g. gemini_live.go) from the Live API's
-	// ServerContent.InputTranscription / OutputTranscription fields.
-	InputTranscription  *genai.Transcription
-	OutputTranscription *genai.Transcription
+	// SessionResumptionHandle is the upstream (v1.5.0) live resumption handle.
+	SessionResumptionHandle string
 
 	// Live-only: session resumption state update from the server.
 	SessionResumptionUpdate *genai.LiveServerSessionResumptionUpdate

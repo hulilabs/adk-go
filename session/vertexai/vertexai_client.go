@@ -16,6 +16,7 @@ package vertexai
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -32,20 +33,14 @@ import (
 
 	"google.golang.org/adk/model"
 	"google.golang.org/adk/session"
+	vertexaiutil "google.golang.org/adk/util/vertexai"
 
 	aiplatform "cloud.google.com/go/aiplatform/apiv1beta1"
 	aiplatformpb "cloud.google.com/go/aiplatform/apiv1beta1/aiplatformpb"
 )
 
-const (
-	engineResourceTemplate  = "projects/%s/locations/%s/reasoningEngines/%s"
-	sessionResourceTemplate = engineResourceTemplate + "/sessions/%s"
-)
-
 type vertexAiClient struct {
-	location        string
-	projectID       string
-	reasoningEngine string
+	agentEngineData *vertexaiutil.AgentEngineData
 	rpcClient       *aiplatform.SessionClient
 }
 
@@ -54,7 +49,14 @@ func newVertexAiClient(ctx context.Context, location, projectID, reasoningEngine
 	if err != nil {
 		return nil, fmt.Errorf("could not establish connection to the aiplatform server: %w", err)
 	}
-	return &vertexAiClient{location, projectID, reasoningEngine, rpcClient}, nil
+	return &vertexAiClient{
+		agentEngineData: &vertexaiutil.AgentEngineData{
+			Location:        location,
+			ProjectID:       projectID,
+			ReasoningEngine: reasoningEngine,
+		},
+		rpcClient: rpcClient,
+	}, nil
 }
 
 // Ensure you close it when your application shuts down
@@ -68,7 +70,7 @@ func (c *vertexAiClient) createSession(ctx context.Context, req *session.CreateR
 	}
 	// Convert and set the initial state if provided
 	if len(req.State) > 0 {
-		stateStruct, err := structpb.NewStruct(req.State)
+		stateStruct, err := toStructPB(req.State)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert state to structpb: %w", err)
 		}
@@ -79,9 +81,15 @@ func (c *vertexAiClient) createSession(ctx context.Context, req *session.CreateR
 	if err != nil {
 		return nil, err
 	}
+	aeData := &vertexaiutil.AgentEngineData{
+		Location:        c.agentEngineData.Location,
+		ProjectID:       c.agentEngineData.ProjectID,
+		ReasoningEngine: reasoningEngine,
+	}
 	rpcReq := &aiplatformpb.CreateSessionRequest{
-		Parent:  fmt.Sprintf(engineResourceTemplate, c.projectID, c.location, reasoningEngine),
-		Session: pbSession,
+		Parent:    vertexaiutil.AgentEngineResource(aeData),
+		Session:   pbSession,
+		SessionId: req.SessionID,
 	}
 	lro, err := c.rpcClient.CreateSession(ctx, rpcReq)
 	if err != nil {
@@ -168,8 +176,15 @@ func (c *vertexAiClient) listSessions(ctx context.Context, req *session.ListRequ
 	if err != nil {
 		return nil, err
 	}
+
+	aeData := vertexaiutil.AgentEngineData{
+		Location:        c.agentEngineData.Location,
+		ProjectID:       c.agentEngineData.ProjectID,
+		ReasoningEngine: reasoningEngine,
+	}
+
 	rpcReq := &aiplatformpb.ListSessionsRequest{
-		Parent: fmt.Sprintf(engineResourceTemplate, c.projectID, c.location, reasoningEngine),
+		Parent: vertexaiutil.AgentEngineResource(&aeData),
 	}
 	if req.UserID != "" {
 		rpcReq.Filter = fmt.Sprintf("userId=\"%s\"", req.UserID)
@@ -241,7 +256,7 @@ func (c *vertexAiClient) appendEvent(ctx context.Context, appName, sessionID str
 	var eventState *aiplatformpb.EventActions
 	// Convert and set the initial state if provided
 	if len(event.Actions.StateDelta) > 0 {
-		sessionState, err := structpb.NewStruct(event.Actions.StateDelta)
+		sessionState, err := toStructPB(event.Actions.StateDelta)
 		if err != nil {
 			return fmt.Errorf("failed to convert state to structpb: %w", err)
 		}
@@ -392,7 +407,12 @@ func sessionIDByOperationName(on string) (string, error) {
 }
 
 func sessionNameByID(id string, c *vertexAiClient, reasoningEngine string) string {
-	return fmt.Sprintf(sessionResourceTemplate, c.projectID, c.location, reasoningEngine, id)
+	aeData := &vertexaiutil.AgentEngineData{
+		Location:        c.agentEngineData.Location,
+		ProjectID:       c.agentEngineData.ProjectID,
+		ReasoningEngine: reasoningEngine,
+	}
+	return vertexaiutil.SessionResource(aeData, id)
 }
 
 // (?:...) tells Go "match this, but don't save it in the results array".
@@ -400,8 +420,8 @@ func sessionNameByID(id string, c *vertexAiClient, reasoningEngine string) strin
 var reasoningEnginePattern = regexp.MustCompile(`^projects/(?:[a-zA-Z0-9-_]+)/locations/(?:[a-zA-Z0-9-_]+)/reasoningEngines/(\d+)$`)
 
 func (c *vertexAiClient) getReasoningEngineID(appName string) (string, error) {
-	if c.reasoningEngine != "" {
-		return c.reasoningEngine, nil
+	if c.agentEngineData.ReasoningEngine != "" {
+		return c.agentEngineData.ReasoningEngine, nil
 	}
 
 	// Check if appName consists only of digits
@@ -443,12 +463,14 @@ func aiplatformToGenaiContent(rpcResp *aiplatformpb.SessionEvent) *genai.Content
 			case *aiplatformpb.Part_FunctionCall:
 				argsMap := v.FunctionCall.Args.AsMap() // Converts *structpb.Struct -> map[string]any
 				part.FunctionCall = &genai.FunctionCall{
+					ID:   v.FunctionCall.Id,
 					Name: v.FunctionCall.Name,
 					Args: argsMap,
 				}
 			case *aiplatformpb.Part_FunctionResponse:
 				responseMap := v.FunctionResponse.Response.AsMap() // Converts *structpb.Struct -> map[string]any
 				part.FunctionResponse = &genai.FunctionResponse{
+					ID:       v.FunctionResponse.Id,
 					Name:     v.FunctionResponse.Name,
 					Response: responseMap,
 				}
@@ -484,7 +506,7 @@ func createAiplatformpbContent(event *session.Event) (*aiplatformpb.Content, err
 				}
 			}
 			if part.FunctionCall != nil {
-				args, err := structpb.NewStruct(part.FunctionCall.Args)
+				args, err := toStructPB(part.FunctionCall.Args)
 				if err != nil {
 					return nil, fmt.Errorf("failed to convert function call to structpb: %w", err)
 				}
@@ -497,7 +519,7 @@ func createAiplatformpbContent(event *session.Event) (*aiplatformpb.Content, err
 				}
 			}
 			if part.FunctionResponse != nil {
-				response, err := structpb.NewStruct(part.FunctionResponse.Response)
+				response, err := toStructPB(part.FunctionResponse.Response)
 				if err != nil {
 					return nil, fmt.Errorf("failed to convert function response to structpb: %w", err)
 				}
@@ -531,7 +553,7 @@ func createAiplatformpbMetadata(event *session.Event) (*aiplatformpb.EventMetada
 		Branch:             event.Branch,
 	}
 	if event.CustomMetadata != nil {
-		customMetadata, err := structpb.NewStruct(event.CustomMetadata)
+		customMetadata, err := toStructPB(event.CustomMetadata)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert event customMetadata to structpb: %w", err)
 		}
@@ -761,6 +783,22 @@ func createGroundingMetadata(metadata *aiplatformpb.GroundingMetadata) *genai.Gr
 	}
 
 	return out
+}
+
+// toStructPB converts an arbitrary Go value into a protobuf Struct.
+// It uses JSON marshaling as an intermediary step to safely serialize
+// the input data before constructing the *structpb.Struct.
+// Returns an error if any part of the JSON round-trip or conversion fails.
+func toStructPB(value any) (*structpb.Struct, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal value: %w", err)
+	}
+	res := &structpb.Struct{}
+	if err := res.UnmarshalJSON(data); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON data to structpb: %w", err)
+	}
+	return res, nil
 }
 
 // derefString is a helper to safely dereference string pointers

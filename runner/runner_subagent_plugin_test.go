@@ -307,7 +307,7 @@ func TestSubRunnerInheritsParentPlugins(t *testing.T) {
 		queue := agent.NewLiveRequestQueue(100)
 		queue.Close()
 
-		for _, err := range r.RunLive(
+		for _, err := range r.RunLiveQueue(
 			context.Background(), "user1", "sess1", queue, agent.RunConfig{},
 		) {
 			if err != nil && err != io.EOF {
@@ -412,7 +412,7 @@ func TestRunLiveInheritsContextPluginManager(t *testing.T) {
 	queue := agent.NewLiveRequestQueue(100)
 	queue.Close()
 
-	for _, err := range r.RunLive(
+	for _, err := range r.RunLiveQueue(
 		seededCtx, "user1", "sess1", queue, agent.RunConfig{},
 	) {
 		if err != nil && err != io.EOF {
