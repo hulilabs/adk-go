@@ -46,6 +46,9 @@
 //     by substring-matching error text ("GoAway", "EOF", "1008", ...).
 //   - Reconnects retry immediately in a loop with no backoff and no
 //     attempt budget.
+//   - Each reconnect abandons the previous attempt's unbuffered error
+//     channel, leaking a blocked reader/sender goroutine per cycle
+//     (reported upstream: google/adk-go#1152).
 //   - The preprocessed history is re-sent on every reconnect, even when
 //     resuming with a session handle the server already has context for.
 //   - ToolCallCancellation server messages are dropped, so cancelled
