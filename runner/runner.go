@@ -601,12 +601,15 @@ func (r *Runner) appendMessageToSession(ctx agent.InvocationContext, storedSessi
 // Unlike Run(), it always uses the root agent and does not append an initial user message.
 // Audio events (CustomMetadata["is_audio"]==true) are not persisted to the session.
 //
-// RunLiveQueue is the fork-supported live entry point: it drives the
+// RunLiveQueue is the hulilabs-supported live entry point: it drives the
 // internal/llminternal/liveflow engine via a *agent.LiveRequestQueue and
 // returns the event stream as an iterator. It coexists with the upstream
-// [Runner.RunLive] (agent.LiveSession API) that arrived in v1.5.0; the method
-// was renamed from RunLive so upstream keeps that name and future syncs stay
-// conflict-free.
+// [Runner.RunLive] (agent.LiveSession API) that arrived in v1.5.0, which
+// drives the upstream live engine — as of v1.5.0 that engine has known
+// gaps (string-matched GoAway, no reconnect backoff, history re-sent on
+// resume, tool cancellation ignored; see the liveflow package doc for the
+// full comparison). The method was renamed from RunLive so upstream keeps
+// that name and future syncs stay conflict-free.
 func (r *Runner) RunLiveQueue(
 	ctx context.Context,
 	userID, sessionID string,

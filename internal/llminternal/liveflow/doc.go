@@ -33,4 +33,30 @@
 //
 // eventOrError and sendEvent (flow.go) are the shared channel currency
 // every concern uses to publish events into RunLive's iterator output.
+//
+// # Relationship to the upstream live engine
+//
+// Since the google/adk-go v1.5.0 merge, two live engines coexist in this
+// repository. Runner.RunLive, the agent.LiveSession API, and the adkrest
+// /run_live endpoint drive the UPSTREAM engine (llminternal Flow.RunLive
+// plus the googlellm live connection) — not this package. As of v1.5.0
+// that engine has known gaps:
+//
+//   - GoAway is not surfaced as a signal; reconnect eligibility is decided
+//     by substring-matching error text ("GoAway", "EOF", "1008", ...).
+//   - Reconnects retry immediately in a loop with no backoff and no
+//     attempt budget.
+//   - The preprocessed history is re-sent on every reconnect, even when
+//     resuming with a session handle the server already has context for.
+//   - ToolCallCancellation server messages are dropped, so cancelled
+//     tool calls keep running.
+//   - Every event is authored as the agent, so input transcriptions
+//     (user speech) are misattributed to the model in session history.
+//
+// Runner.RunLiveQueue driving this package is the hulilabs-supported live
+// path: it handles each of the above (GoAway-aware reconnects with
+// resumption handles, turn-cycle replay suppression, tool cancellation,
+// role-correct transcription events). Route new live features and fixes
+// here; treat the upstream engine as upstream-owned code that syncs with
+// google/adk-go.
 package liveflow
