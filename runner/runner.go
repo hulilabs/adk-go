@@ -335,6 +335,17 @@ func (s *closedLiveSession) Close() error {
 	return nil
 }
 
+// RunLive runs the agent in live bidirectional streaming mode via the
+// upstream (google/adk-go) live engine introduced in v1.5.0, returning an
+// [agent.LiveSession] for sending client events alongside the event stream.
+//
+// Fork note: this is not the method named RunLive before the v1.5.0 merge —
+// the fork's queue-based entry point is now [Runner.RunLiveQueue] and remains
+// the hulilabs-supported live path. The upstream engine behind this method
+// has known gaps (see [Runner.RunLiveQueue] and the
+// internal/llminternal/liveflow package doc) and its events never carry
+// [session.LiveDiagnostics]. Pre-v1.5.0 RunLive callers should migrate to
+// RunLiveQueue, not to this method.
 func (r *Runner) RunLive(ctx context.Context, userID, sessionID string, cfg agent.LiveRunConfig, opts ...RunOption) (agent.LiveSession, iter.Seq2[*session.Event, error], error) {
 	options := runOptions{}
 	for _, opt := range opts {
