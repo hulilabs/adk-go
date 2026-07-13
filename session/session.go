@@ -118,9 +118,9 @@ type Event struct {
 	// Only valid for function call event.
 	LongRunningToolIDs []string
 
-	// LiveDiagnostics is populated only for events from RunLive sessions.
-	// EPHEMERAL: not persisted to storage. Nil for standard Run() events
-	// and for events loaded from storage.
+	// LiveDiagnostics is populated only for events from RunLiveQueue sessions.
+	// EPHEMERAL: not persisted to storage. Nil for standard Run() events, for
+	// events from the upstream-API RunLive, and for events loaded from storage.
 	LiveDiagnostics *LiveDiagnostics
 }
 

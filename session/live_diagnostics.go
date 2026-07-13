@@ -17,8 +17,10 @@ package session
 import "time"
 
 // LiveDiagnostics captures computed timing and protocol state for a live
-// streaming event. Only populated for events produced by RunLive; nil for
-// standard Run() events.
+// streaming event. Only populated for events produced by the runner's
+// RunLiveQueue; nil for standard Run() events and for events produced by
+// the upstream-API RunLive (agent.LiveSession signature), whose engine does
+// not compute diagnostics.
 //
 // EPHEMERAL: This struct is NOT persisted to storage. It is attached to
 // yielded events for the caller's use only. The runner strips it before
