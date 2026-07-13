@@ -380,7 +380,12 @@ func (r *Runner) RunLive(ctx context.Context, userID, sessionID string, cfg agen
 		StreamingMode: runconfig.StreamingModeBidi, // Live is always bidirectional streaming
 		Live:          &cfg,
 	})
-	ctx = plugininternal.ToContext(ctx, r.pluginManager)
+	// Same guard as Run() and RunLiveQueue(): a plugin-less (sub-)runner must
+	// inherit the parent's plugin manager from context instead of clobbering
+	// it with its own empty one, so model/tool/agent callbacks still propagate.
+	if r.pluginManager != nil && r.pluginManager.HasPlugins() {
+		ctx = plugininternal.ToContext(ctx, r.pluginManager)
+	}
 
 	var artifacts agent.Artifacts
 	if r.artifactService != nil {
