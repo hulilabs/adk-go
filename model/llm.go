@@ -66,7 +66,13 @@ type LLMResponse struct {
 	// SessionResumptionHandle is the upstream (v1.5.0) live resumption handle.
 	SessionResumptionHandle string
 
-	// Live-only: session resumption state update from the server.
+	// SessionResumptionUpdate is the fork's structured session-resumption
+	// carrier (Live-only). Two carriers coexist by design — do not remove
+	// either: the upstream live engine (llminternal Flow.RunLive, fed by
+	// the googlellm connection) reads the plain SessionResumptionHandle
+	// string above, while the hulilabs liveflow engine
+	// (internal/llminternal/liveflow, fed by model/gemini) consumes this
+	// full update so it can also honor Resumable=false handle invalidation.
 	SessionResumptionUpdate *genai.LiveServerSessionResumptionUpdate
 	// Live-only: GoAway signal indicating the server wants the client to reconnect.
 	GoAway *genai.LiveServerGoAway
