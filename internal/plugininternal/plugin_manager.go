@@ -72,6 +72,16 @@ func (pm *PluginManager) registerPlugin(plugin *plugin.Plugin) error {
 	return nil
 }
 
+// HasPlugins reports whether the PluginManager has any registered plugins.
+// This is used by the runner to decide whether to overwrite an inherited
+// plugin manager in context (e.g. from a parent runner via agenttool).
+func (pm *PluginManager) HasPlugins() bool {
+	if pm == nil {
+		return false
+	}
+	return len(pm.plugins) > 0
+}
+
 // RunOnUserMessageCallback runs the OnUserMessageCallback for all plugins.
 func (pm *PluginManager) RunOnUserMessageCallback(cctx agent.InvocationContext, userMessage *genai.Content) (*genai.Content, error) {
 	for _, plugin := range pm.plugins {
@@ -168,7 +178,7 @@ func (pm *PluginManager) RunAfterAgentCallback(cctx agent.CallbackContext) (*gen
 }
 
 // RunBeforeToolCallback runs the BeforeToolCallback for all plugins.
-func (pm *PluginManager) RunBeforeToolCallback(ctx tool.Context, tool tool.Tool, args map[string]any) (map[string]any, error) {
+func (pm *PluginManager) RunBeforeToolCallback(ctx agent.ToolContext, tool tool.Tool, args map[string]any) (map[string]any, error) {
 	for _, plugin := range pm.plugins {
 		callback := plugin.BeforeToolCallback()
 		if callback != nil {
@@ -185,7 +195,7 @@ func (pm *PluginManager) RunBeforeToolCallback(ctx tool.Context, tool tool.Tool,
 }
 
 // RunAfterToolCallback runs the AfterToolCallback for all plugins.
-func (pm *PluginManager) RunAfterToolCallback(ctx tool.Context, tool tool.Tool, args, result map[string]any, err error) (map[string]any, error) {
+func (pm *PluginManager) RunAfterToolCallback(ctx agent.ToolContext, tool tool.Tool, args, result map[string]any, err error) (map[string]any, error) {
 	for _, plugin := range pm.plugins {
 		callback := plugin.AfterToolCallback()
 		if callback != nil {
@@ -202,7 +212,7 @@ func (pm *PluginManager) RunAfterToolCallback(ctx tool.Context, tool tool.Tool, 
 }
 
 // RunOnToolErrorCallback runs the OnToolErrorCallback for all plugins.
-func (pm *PluginManager) RunOnToolErrorCallback(ctx tool.Context, tool tool.Tool, args map[string]any, err error) (map[string]any, error) {
+func (pm *PluginManager) RunOnToolErrorCallback(ctx agent.ToolContext, tool tool.Tool, args map[string]any, err error) (map[string]any, error) {
 	for _, plugin := range pm.plugins {
 		callback := plugin.OnToolErrorCallback()
 		if callback != nil {
@@ -285,4 +295,10 @@ func (pm *PluginManager) Close() error {
 
 func ToContext(ctx context.Context, cfg *PluginManager) context.Context {
 	return context.WithValue(ctx, plugincontext.PluginManagerCtxKey, cfg)
+}
+
+// FromContext retrieves the PluginManager from the context, or nil if none is set.
+func FromContext(ctx context.Context) *PluginManager {
+	m, _ := ctx.Value(plugincontext.PluginManagerCtxKey).(*PluginManager)
+	return m
 }

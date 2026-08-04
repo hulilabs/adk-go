@@ -434,7 +434,7 @@ func (lf *LiveFlow) callToolLive(
 		return map[string]any{"error": err.Error()}, err
 	}
 
-	// Rebind invCtx onto ctx so toolinternal.NewToolContext produces a
+	// Rebind invCtx onto ctx so agent.NewToolContext produces a
 	// tool.Context whose Value() chain reaches the execute_tool span.
 	// Without this, a tool implementation that calls
 	// trace.SpanFromContext(toolCtx) would observe the generate_content
@@ -442,7 +442,7 @@ func (lf *LiveFlow) callToolLive(
 	// incorrectly.
 	invCtx = invCtx.WithContext(ctx)
 
-	toolCtx := toolinternal.NewToolContext(invCtx, fc.ID, &session.EventActions{StateDelta: make(map[string]any)}, nil)
+	toolCtx := agent.NewToolContext(invCtx, fc.ID, &session.EventActions{StateDelta: make(map[string]any)}, nil)
 	wrappedCtx := &cancelableToolContext{Context: toolCtx, cancelCtx: ctx}
 
 	response, err := lf.runToolWithCallbacks(wrappedCtx, invCtx, funcTool, fc.Args)

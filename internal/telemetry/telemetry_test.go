@@ -129,7 +129,7 @@ func TestInvokeAgent(t *testing.T) {
 		{
 			name: "Success",
 			resultParams: TraceAgentResultParams{
-				ResponseEvent: session.NewEvent("test-invocation-id"),
+				ResponseEvent: session.NewEventWithContext(context.Background(), "test-invocation-id"),
 			},
 			wantName:   "invoke_agent test-agent",
 			wantStatus: codes.Unset,
@@ -230,9 +230,9 @@ func TestGenerateContent(t *testing.T) {
 				semconv.GenAIOperationNameKey:         "generate_content",
 				semconv.GenAIRequestModelKey:          "test-model",
 				semconv.GenAIUsageInputTokensKey:      "10",
-				semconv.GenAIUsageOutputTokensKey:     "20",
+				semconv.GenAIUsageOutputTokensKey:     "35",
 				genAIUsageCacheReadInputTokens:        "5",
-				genAIUsageExperimentalReasoningTokens: "15",
+				genAIUsageReasoningOutputTokens:       "15",
 				semconv.GenAIResponseFinishReasonsKey: "[\"STOP\"]",
 				gcpVertexAgentInvocationID:            invocationID,
 			},

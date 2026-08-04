@@ -321,45 +321,6 @@ func (lf *LiveFlow) startSessionLoops(
 	return eventCh, wg
 }
 
-func (lf *LiveFlow) sendHistory(
-	cancelCtx context.Context,
-	ctx agent.InvocationContext,
-	conn model.LiveConnection,
-	ts *liveTimingState,
-) error {
-	events := ctx.Session().Events()
-
-	// Collect non-nil content events.
-	var turns []*genai.Content
-	for i := range events.Len() {
-		ev := events.At(i)
-		if ev.Content != nil {
-			turns = append(turns, ev.Content)
-		}
-	}
-	if len(turns) == 0 {
-		return nil
-	}
-
-	// Send all history turns with TurnComplete=false so the model absorbs
-	// them as context without responding to each one individually.
-	// Only the last turn is sent with TurnComplete=true to signal
-	// that history replay is complete.
-	falseVal := false
-	for i, content := range turns {
-		isLast := i == len(turns)-1
-		req := &model.LiveRequest{Content: content}
-		if !isLast {
-			req.TurnComplete = &falseVal
-		}
-		// Last turn uses default (TurnComplete=nil → true).
-		if err := trackedSend(cancelCtx, conn, req, ts); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // ErrIter returns an iterator that yields a single error.
 func ErrIter(err error) iter.Seq2[*session.Event, error] {
 	return func(yield func(*session.Event, error) bool) {

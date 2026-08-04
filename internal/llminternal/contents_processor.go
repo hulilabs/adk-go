@@ -70,9 +70,9 @@ func buildContentsDefault(agentName, invocationBranch string, events []*session.
 	for _, ev := range events {
 		content := utils.Content(ev)
 		// Skip events without content or generated neither by user nor
-		// by model.
-		// e.g. events purely for mutating session states.
-		if content == nil || content.Role == "" || len(content.Parts) == 0 {
+		// by model, UNLESS they have transcriptions.
+		if (content == nil || content.Role == "" || len(content.Parts) == 0) &&
+			ev.LLMResponse.InputTranscription == nil && ev.LLMResponse.OutputTranscription == nil {
 			// TODO: log a bad event with content but no Role is skipped
 			// Note: python checks here if content.Parts[0] is an empty string and skip if so.
 			// But unlike python that distinguishes None vs empty string, two cases are indistinguishable in Go.
@@ -92,6 +92,53 @@ func buildContentsDefault(agentName, invocationBranch string, events []*session.
 			filtered = append(filtered, ev)
 		}
 	}
+
+	// Aggregate transcription events (convert to text parts on the fly)
+	var processedEvents []*session.Event
+	var accumulatedInputTranscription string
+	var accumulatedOutputTranscription string
+
+	for i := 0; i < len(filtered); i++ {
+		ev := filtered[i]
+		content := utils.Content(ev)
+		if content == nil || len(content.Parts) == 0 {
+			if ev.LLMResponse.InputTranscription != nil && ev.LLMResponse.InputTranscription.Text != "" {
+				accumulatedInputTranscription += ev.LLMResponse.InputTranscription.Text
+				if i != len(filtered)-1 &&
+					filtered[i+1].LLMResponse.InputTranscription != nil &&
+					filtered[i+1].LLMResponse.InputTranscription.Text != "" {
+					continue
+				}
+				// Create a new event with content
+				newEv := cloneEvent(ev)
+				newEv.LLMResponse.InputTranscription = nil
+				newEv.LLMResponse.Content = &genai.Content{
+					Role:  genai.RoleUser,
+					Parts: []*genai.Part{{Text: accumulatedInputTranscription}},
+				}
+				ev = newEv
+				accumulatedInputTranscription = ""
+			} else if ev.LLMResponse.OutputTranscription != nil && ev.LLMResponse.OutputTranscription.Text != "" {
+				accumulatedOutputTranscription += ev.LLMResponse.OutputTranscription.Text
+				if i != len(filtered)-1 &&
+					filtered[i+1].LLMResponse.OutputTranscription != nil &&
+					filtered[i+1].LLMResponse.OutputTranscription.Text != "" {
+					continue
+				}
+				// Create a new event with content
+				newEv := cloneEvent(ev)
+				newEv.LLMResponse.OutputTranscription = nil
+				newEv.LLMResponse.Content = &genai.Content{
+					Role:  "model",
+					Parts: []*genai.Part{{Text: accumulatedOutputTranscription}},
+				}
+				ev = newEv
+				accumulatedOutputTranscription = ""
+			}
+		}
+		processedEvents = append(processedEvents, ev)
+	}
+	filtered = processedEvents
 
 	//  src/google/adk/flows/llm_flows/contents.py
 	// 	 - _rearrange_events_for_async_function_response
@@ -225,10 +272,18 @@ SearchLoop: // A label to allow breaking out of the nested loop
 		)
 	}
 
-	// Collect all function response events *between* the call and the last response.
+	// Collect function response events related to the matching call while
+	// preserving unrelated tool events that happened in between.
 	var responseEventsToMerge []*session.Event
+	resultEvents := events[:functionCallEventIdx+1]
 	for i := functionCallEventIdx + 1; i < len(events)-1; i++ {
 		event := events[i]
+		calls := utils.FunctionCalls(event.Content)
+		if len(calls) > 0 {
+			resultEvents = append(resultEvents, event)
+			continue
+		}
+
 		responses := utils.FunctionResponses(event.Content)
 		if len(responses) == 0 {
 			continue
@@ -245,13 +300,14 @@ SearchLoop: // A label to allow breaking out of the nested loop
 
 		if isRelated {
 			responseEventsToMerge = append(responseEventsToMerge, event)
+		} else {
+			resultEvents = append(resultEvents, event)
 		}
 	}
 
 	// Add the final response event itself to the list to be merged.
 	responseEventsToMerge = append(responseEventsToMerge, events[len(events)-1])
 
-	resultEvents := events[:functionCallEventIdx+1]
 	mergedEvent, err := mergeFunctionResponseEvents(responseEventsToMerge)
 	if err != nil {
 		return nil, err
@@ -269,6 +325,11 @@ SearchLoop: // A label to allow breaking out of the nested loop
 // useful for histories involving long running tool calls where
 // responses may not have originally been consecutive. It preserves all
 // non-tool-call events (like user messages) in their original order.
+//
+// The call/response pair answered by the final event in the history is
+// emitted last: the latest function response is the newest information in
+// the session, and models act on the final contents, so it must not be
+// re-attached mid-history behind older (now stale) exchanges.
 //
 // It returns a new, correctly ordered slice of events or an error if the
 // history is malformed (e.g., a response is found without a corresponding call).
@@ -289,8 +350,16 @@ func rearrangeEventsForFunctionResponsesInHistory(events []*session.Event) ([]*s
 		}
 	}
 
+	// The last event is the model's freshest information. When it is a
+	// function response (e.g. a long running tool completed after later,
+	// unrelated exchanges), its call/response pair must remain the last
+	// exchange in the rebuilt history.
+	lastEventIndex := len(events) - 1
+
 	// Rebuild the event list
 	var resultEvents []*session.Event
+	// Call/response pair answered by the final event; appended last.
+	var tailPair []*session.Event
 
 	for _, event := range events {
 		// If the event contains responses, skip it. It will be handled
@@ -304,9 +373,6 @@ func rearrangeEventsForFunctionResponsesInHistory(events []*session.Event) ([]*s
 			// This is a regular event (e.g., user message). Just append it.
 			resultEvents = append(resultEvents, event)
 		} else {
-			// This is a function call event, append it and search for responses
-			resultEvents = append(resultEvents, event)
-
 			// Find the unique indices of all corresponding response events.
 			// Using a map[int]struct{} as a set.
 			responseEventIndicesSet := make(map[int]struct{})
@@ -316,6 +382,15 @@ func rearrangeEventsForFunctionResponsesInHistory(events []*session.Event) ([]*s
 				}
 			}
 
+			// This is a function call event: append it, then its responses.
+			// If the pair is answered by the final event, route the whole
+			// pair (call + consolidated response) to the tail instead.
+			dst := &resultEvents
+			if _, found := responseEventIndicesSet[lastEventIndex]; found {
+				dst = &tailPair
+			}
+			*dst = append(*dst, event)
+
 			// If no responses were found for any calls in this event, continue.
 			if len(responseEventIndicesSet) == 0 {
 				continue
@@ -324,7 +399,7 @@ func rearrangeEventsForFunctionResponsesInHistory(events []*session.Event) ([]*s
 			// If there's only one unique response event, append it directly.
 			if len(responseEventIndicesSet) == 1 {
 				for index := range responseEventIndicesSet { // A trick to get the single key
-					resultEvents = append(resultEvents, events[index])
+					*dst = append(*dst, events[index])
 				}
 			} else {
 				// Multiple response events exist for that function call so we merge them.
@@ -346,12 +421,12 @@ func rearrangeEventsForFunctionResponsesInHistory(events []*session.Event) ([]*s
 				if err != nil {
 					return nil, fmt.Errorf("failed to merge response events: %w", err)
 				}
-				resultEvents = append(resultEvents, mergedEvent)
+				*dst = append(*dst, mergedEvent)
 			}
 		}
 	}
 
-	return resultEvents, nil
+	return append(resultEvents, tailPair...), nil
 }
 
 // mergeFunctionResponseEvents merges a list of function response events into one.

@@ -16,9 +16,11 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"io"
 	"iter"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -302,7 +304,7 @@ func collectEvents(t *testing.T, r *Runner, queue *agent.LiveRequestQueue) ([]*s
 	t.Helper()
 	var events []*session.Event
 	var errs []error
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -596,7 +598,7 @@ func TestScenario3_InFlightToolCancellation(t *testing.T) {
 	start := time.Now()
 	cfg := agent.RunConfig{ToolCoalesceWindow: 10 * time.Millisecond}
 	var events []*session.Event
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, cfg) {
 		if err != nil {
 			break
 		}
@@ -664,10 +666,64 @@ func TestScenario4_ReceiveError(t *testing.T) {
 // Scenario 5: Connection error mid-stream (send side)
 // ---------------------------------------------------------------------------
 
-func TestScenario5_SendError(t *testing.T) {
+// containsErr reports whether any collected error matches target via
+// errors.Is. Send failures can be accompanied by an EOF from the receiver
+// unwinding after the connection closes, so assertions must check
+// containment rather than the exact or final error.
+func containsErr(errs []error, target error) bool {
+	for _, err := range errs {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestScenario5_SendError_HistoryFails(t *testing.T) {
 	conn := newMockLiveConnection()
 	conn.recvCh = make(chan *model.LLMResponse, 10) // blocks until close
-	conn.sendErrAt = 2
+	// The batched history replay is deterministically send #0: it happens
+	// in runSession before the sender/receiver loops start.
+	conn.sendErrAt = 0
+	conn.sendErr = io.ErrClosedPipe
+
+	priorEvents := []*session.Event{
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("Hello", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("Hi", "model")}, Author: "test_agent"},
+	}
+
+	r, _, _ := setupRunnerWithEvents(t, conn, nil, nil, priorEvents)
+
+	queue := agent.NewLiveRequestQueue(100)
+	queue.Close() // failure happens during history handoff, before the loops
+
+	_, errs := collectEvents(t, r, queue)
+
+	found := false
+	for _, err := range errs {
+		if errors.Is(err, io.ErrClosedPipe) && strings.Contains(err.Error(), "history handoff failed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a 'history handoff failed' error wrapping %v, got %v", io.ErrClosedPipe, errs)
+	}
+
+	// Failed sends are not logged by the mock; nothing succeeded.
+	if sendLog := conn.SendLog(); len(sendLog) != 0 {
+		t.Errorf("expected 0 successful sends, got %d", len(sendLog))
+	}
+
+	if !conn.WasClosed() {
+		t.Error("expected connection to be closed")
+	}
+}
+
+func TestScenario5_SendError_QueueSendFails(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvCh = make(chan *model.LLMResponse, 10) // blocks until close
+	// Send #0 is the batched history replay; #1 is the queued message.
+	conn.sendErrAt = 1
 	conn.sendErr = io.ErrClosedPipe
 
 	priorEvents := []*session.Event{
@@ -688,13 +744,16 @@ func TestScenario5_SendError(t *testing.T) {
 
 	_, errs := collectEvents(t, r, queue)
 
-	if len(errs) == 0 {
-		t.Fatal("expected send error")
+	if !containsErr(errs, io.ErrClosedPipe) {
+		t.Fatalf("expected a send error matching %v, got %v", io.ErrClosedPipe, errs)
 	}
 
 	sendLog := conn.SendLog()
-	if len(sendLog) != 2 {
-		t.Errorf("expected 2 successful sends (history), got %d", len(sendLog))
+	if len(sendLog) != 1 {
+		t.Fatalf("expected 1 successful send (batched history), got %d", len(sendLog))
+	}
+	if len(sendLog[0].Contents) != 2 {
+		t.Errorf("history batch size = %d, want 2", len(sendLog[0].Contents))
 	}
 
 	if !conn.WasClosed() {
@@ -735,23 +794,78 @@ func TestScenario6_HistoryHandoff(t *testing.T) {
 	collectEvents(t, r, queue)
 
 	sendLog := conn.SendLog()
-	if len(sendLog) < 5 {
-		t.Fatalf("expected at least 5 sends (4 history + 1 queue), got %d", len(sendLog))
+	if len(sendLog) != 2 {
+		t.Fatalf("expected 2 sends (1 batched history + 1 queue message), got %d", len(sendLog))
 	}
 
-	// First 4 should be history
-	for i := range 4 {
-		if sendLog[i].Content == nil {
-			t.Errorf("send[%d] should have Content (history)", i)
+	// Send #0 is the whole history as one batch, in order.
+	hist := sendLog[0]
+	if len(hist.Contents) != 4 {
+		t.Fatalf("history batch size = %d, want 4", len(hist.Contents))
+	}
+	wantTexts := []string{"Hello", "Hi there", "What's the weather?", "Let me check"}
+	for i, want := range wantTexts {
+		if got := hist.Contents[i].Parts[0].Text; got != want {
+			t.Errorf("history[%d] = %q, want %q", i, got, want)
 		}
 	}
-
-	// 5th should be the queue message
-	if sendLog[4].Content == nil {
-		t.Error("send[4] should have Content (queue message)")
+	// The fixture ends on a model turn — the exact #48 bug: the replay must
+	// NOT invite a response.
+	if hist.TurnComplete == nil || *hist.TurnComplete {
+		t.Error("model-final history replay must carry TurnComplete=false")
 	}
-	if sendLog[4].Content.Parts[0].Text != "new question" {
-		t.Errorf("expected 'new question', got %q", sendLog[4].Content.Parts[0].Text)
+
+	// Send #1 is the queue message.
+	if sendLog[1].Content == nil {
+		t.Fatal("send[1] should have Content (queue message)")
+	}
+	if sendLog[1].Content.Parts[0].Text != "new question" {
+		t.Errorf("expected 'new question', got %q", sendLog[1].Content.Parts[0].Text)
+	}
+}
+
+// TestScenario6_HistoryHandoff_UserFinal is the counterpart fixture: history
+// ending on an unanswered user turn must invite exactly one response.
+func TestScenario6_HistoryHandoff_UserFinal(t *testing.T) {
+	conn := newMockLiveConnection()
+	conn.recvCh = make(chan *model.LLMResponse, 10)
+
+	priorEvents := []*session.Event{
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("Hello", "user")}, Author: "user"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("Hi there", "model")}, Author: "test_agent"},
+		{LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("What's the weather?", "user")}, Author: "user"},
+	}
+
+	r, _, _ := setupRunnerWithEvents(t, conn, nil, nil, priorEvents)
+
+	queue := agent.NewLiveRequestQueue(100)
+
+	go func() {
+		// Wait for the history send, then let the model "answer" and close.
+		time.Sleep(100 * time.Millisecond)
+		conn.recvCh <- turnCompleteResponse()
+		time.Sleep(50 * time.Millisecond)
+		queue.Close()
+	}()
+
+	collectEvents(t, r, queue)
+
+	sendLog := conn.SendLog()
+	if len(sendLog) != 1 {
+		t.Fatalf("expected 1 send (batched history), got %d", len(sendLog))
+	}
+	hist := sendLog[0]
+	if len(hist.Contents) != 3 {
+		t.Fatalf("history batch size = %d, want 3", len(hist.Contents))
+	}
+	wantTexts := []string{"Hello", "Hi there", "What's the weather?"}
+	for i, want := range wantTexts {
+		if got := hist.Contents[i].Parts[0].Text; got != want {
+			t.Errorf("history[%d] = %q, want %q", i, got, want)
+		}
+	}
+	if hist.TurnComplete == nil || !*hist.TurnComplete {
+		t.Error("user-final history replay must carry TurnComplete=true")
 	}
 }
 
@@ -986,7 +1100,7 @@ func TestScenario10_ToolCallCoalescing(t *testing.T) {
 
 	cfg := agent.RunConfig{ToolCoalesceWindow: 100 * time.Millisecond}
 	var events []*session.Event
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, cfg) {
 		if err != nil {
 			break
 		}
@@ -1072,7 +1186,7 @@ func TestScenario11_ModelSpeakingStateTransitions(t *testing.T) {
 		queue.Close()
 	}()
 
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
 		_ = ev
 		_ = err
 	}
@@ -1277,7 +1391,7 @@ func TestScenario15_DeferFlushOnConsumerBreak(t *testing.T) {
 
 	// Consumer collects 2 events then breaks (simulates user pressing Stop).
 	collected := 0
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
 		_ = ev
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1317,7 +1431,7 @@ func TestRunLive_LiveDiagnostics_NotLeakedToSession(t *testing.T) {
 	queue.Close()
 
 	var yieldedEvents []*session.Event
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{}) {
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1615,7 +1729,7 @@ func TestScenario21_LateOrphanFlushAfterTurnComplete(t *testing.T) {
 
 	cfg := agent.RunConfig{ToolCoalesceWindow: 10 * time.Millisecond}
 	var events []*session.Event
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, cfg) {
 		if err != nil {
 			break
 		}
@@ -2306,7 +2420,7 @@ func TestScenario33_EarlyExitFlushesBuffer(t *testing.T) {
 
 	// Consumer reads 2 events (transcript + tool response from coalesce) then breaks.
 	collected := 0
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{ToolCoalesceWindow: 10 * time.Millisecond}) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{ToolCoalesceWindow: 10 * time.Millisecond}) {
 		_ = ev
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -2394,7 +2508,7 @@ func TestScenario34_ReorderFlushBreakNoDoubleAppend(t *testing.T) {
 	// remaining tail is re-flushed.
 	cfg := agent.RunConfig{ToolCoalesceWindow: 5 * time.Millisecond}
 	sawTool := false
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, cfg) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -2677,7 +2791,7 @@ func TestScenario_NonThoughtCancelledThoughtOnlyDoesNotReset(t *testing.T) {
 
 	cfg := agent.RunConfig{ToolCoalesceWindow: 500 * time.Millisecond}
 	var events []*session.Event
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, cfg) {
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, cfg) {
 		if err != nil {
 			break
 		}
@@ -2870,7 +2984,7 @@ func TestScenario16_GoAwayReconnectionWithHandle(t *testing.T) {
 	}()
 
 	var events []*session.Event
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{
 		SessionResumption: &genai.SessionResumptionConfig{},
 	}) {
 		if err != nil {
@@ -2947,11 +3061,15 @@ func TestScenario17_NonResumableClearsHandle(t *testing.T) {
 		AppName: "test", UserID: "user1", SessionID: "sess1",
 	})
 
-	// Append a prior event so the resume-vs-fresh history assertions below
+	// Append prior events so the resume-vs-fresh history assertions below
 	// are meaningful — without prior turns, sendHistory has nothing to
-	// send regardless of handle state.
-	if err := svc.Service.AppendEvent(context.Background(), createResp.Session, priorUserEvent("hello")); err != nil {
-		t.Fatal(err)
+	// send regardless of handle state. The history deliberately ends on a
+	// model turn: the mid-session reconnect after a non-resumable clear
+	// (conn3) replays it and must NOT invite a response (#48).
+	for _, ev := range []*session.Event{priorUserEvent("hello"), priorModelEvent("hi there")} {
+		if err := svc.Service.AppendEvent(context.Background(), createResp.Session, ev); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	r, _ := New(Config{
@@ -2992,7 +3110,7 @@ func TestScenario17_NonResumableClearsHandle(t *testing.T) {
 		queue.Close()
 	}()
 
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{
 		SessionResumption: &genai.SessionResumptionConfig{},
 	}) {
 		_ = ev
@@ -3029,6 +3147,33 @@ func TestScenario17_NonResumableClearsHandle(t *testing.T) {
 	if !hasContentSend(conn3.SendLog()) {
 		t.Error(`conn3 (fresh after non-resumable clear, handle="") should have history replay`)
 	}
+
+	// Both fresh connects must replay the model-final history as a single
+	// ordered batch that does not invite a response — the reconnect path
+	// (conn3) hits the same #48 bug as the initial connect.
+	for _, fresh := range []struct {
+		name string
+		conn *mockLiveConnection
+	}{{"conn1", conn1}, {"conn3", conn3}} {
+		batch := findHistoryBatch(fresh.conn.SendLog())
+		if batch == nil {
+			t.Errorf("%s: no batched history replay found", fresh.name)
+			continue
+		}
+		if len(batch.Contents) != 2 {
+			t.Errorf("%s: history batch size = %d, want 2", fresh.name, len(batch.Contents))
+			continue
+		}
+		if got := batch.Contents[0].Parts[0].Text; got != "hello" {
+			t.Errorf("%s: history[0] = %q, want %q", fresh.name, got, "hello")
+		}
+		if got := batch.Contents[1].Parts[0].Text; got != "hi there" {
+			t.Errorf("%s: history[1] = %q, want %q", fresh.name, got, "hi there")
+		}
+		if batch.TurnComplete == nil || *batch.TurnComplete {
+			t.Errorf("%s: model-final replay must carry TurnComplete=false", fresh.name)
+		}
+	}
 }
 
 // waitForCond polls cond until it returns true or the deadline expires.
@@ -3056,15 +3201,36 @@ func priorUserEvent(text string) *session.Event {
 	return ev
 }
 
-// hasContentSend reports whether log contains a LiveRequest carrying a
-// non-nil Content payload — i.e., a history-replay turn.
+// priorModelEvent builds a session.Event with model-role text content, so a
+// replayed history can end on a model turn (the #48 fixture).
+func priorModelEvent(text string) *session.Event {
+	ev := session.NewEvent("prior")
+	ev.Author = "test_agent"
+	ev.LLMResponse.Content = genai.NewContentFromText(text, "model")
+	return ev
+}
+
+// hasContentSend reports whether log contains a LiveRequest carrying
+// conversation content — a batched history replay (Contents) or a
+// single-turn message (Content).
 func hasContentSend(log []*model.LiveRequest) bool {
 	for _, req := range log {
-		if req.Content != nil {
+		if req.Content != nil || len(req.Contents) > 0 {
 			return true
 		}
 	}
 	return false
+}
+
+// findHistoryBatch returns the first LiveRequest in log carrying a batched
+// history replay, or nil if none was sent.
+func findHistoryBatch(log []*model.LiveRequest) *model.LiveRequest {
+	for _, req := range log {
+		if len(req.Contents) > 0 {
+			return req
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -3120,7 +3286,7 @@ func TestScenarioResumeUsesTransparentTrue(t *testing.T) {
 		queue.Close()
 	}()
 
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{
 		// Caller opts into session resumption with Transparent=false; the
 		// resume path overwrites this on the second connect.
 		SessionResumption: &genai.SessionResumptionConfig{Transparent: false},
@@ -3208,7 +3374,7 @@ func TestScenarioConnectionEOFWithHandleReconnects(t *testing.T) {
 	}()
 
 	var yieldedErr error
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{
 		SessionResumption: &genai.SessionResumptionConfig{},
 	}) {
 		_ = ev
@@ -3287,7 +3453,7 @@ func TestScenarioConnectionEOFWithoutHandleYieldsError(t *testing.T) {
 	}()
 
 	var yieldedErrs []error
-	for ev, err := range r.RunLive(context.Background(), "user1", "sess1", queue, agent.RunConfig{
+	for ev, err := range r.RunLiveQueue(context.Background(), "user1", "sess1", queue, agent.RunConfig{
 		SessionResumption: &genai.SessionResumptionConfig{},
 	}) {
 		_ = ev
