@@ -125,14 +125,17 @@ func (m *geminiModel) modelName(req *model.LLMRequest) string {
 }
 
 // generate calls the model synchronously returning result from the first candidate.
+//
+// A zero-candidate response is NOT an error: the API answers HTTP 200 with no candidates
+// when the PROMPT itself was blocked (PromptFeedback.BlockReason set), and gemini-3* via
+// Vertex also emits candidate-less usage-only payloads. Both are handed to the converter,
+// which maps them to the same shapes the streaming path already produces
+// (ErrorCode = BlockReason with nil Content, or an empty-parts model Content), so callers
+// see one consistent surface instead of a bare "empty response" error on the sync path only.
 func (m *geminiModel) generate(ctx context.Context, req *model.LLMRequest) (*model.LLMResponse, error) {
 	resp, err := m.client.Models.GenerateContent(ctx, m.modelName(req), req.Contents, req.Config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to call model: %w", err)
-	}
-	if len(resp.Candidates) == 0 {
-		// shouldn't happen?
-		return nil, fmt.Errorf("empty response")
 	}
 	return converters.Genai2LLMResponse(resp), nil
 }
