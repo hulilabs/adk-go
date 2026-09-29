@@ -33,6 +33,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Setup
         uses: ./.github/actions/setup
-      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      # Pinned: govulncheck v1.8.0+ requires Go 1.26; this module builds on Go 1.25.
+      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
       - run: govulncheck ./...
         continue-on-error: true # stdlib vulns require Go version bump upstream

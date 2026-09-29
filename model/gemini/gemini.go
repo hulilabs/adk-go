@@ -125,14 +125,18 @@ func (m *geminiModel) modelName(req *model.LLMRequest) string {
 }
 
 // generate calls the model synchronously returning result from the first candidate.
+//
+// A zero-candidate response is NOT an error: the API answers HTTP 200 with no candidates
+// when the PROMPT itself was blocked (PromptFeedback.BlockReason set), and gemini-3* via
+// Vertex also emits candidate-less usage-only payloads. Both are handed to the converter,
+// which maps them to the same shapes the streaming path already produces
+// (ErrorCode = BlockReason with nil Content, or an empty-parts model Content), so callers
+// see one consistent surface instead of a bare "empty response" error on the sync path only.
 func (m *geminiModel) generate(ctx context.Context, req *model.LLMRequest) (*model.LLMResponse, error) {
-	resp, err := m.client.Models.GenerateContent(ctx, m.modelName(req), req.Contents, req.Config)
+	config := configPreservingEmptyTextThoughtSignatures(req.Config)
+	resp, err := m.client.Models.GenerateContent(ctx, m.modelName(req), req.Contents, config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to call model: %w", err)
-	}
-	if len(resp.Candidates) == 0 {
-		// shouldn't happen?
-		return nil, fmt.Errorf("empty response")
 	}
 	return converters.Genai2LLMResponse(resp), nil
 }
@@ -140,9 +144,10 @@ func (m *geminiModel) generate(ctx context.Context, req *model.LLMRequest) (*mod
 // generateStream returns a stream of responses from the model.
 func (m *geminiModel) generateStream(ctx context.Context, req *model.LLMRequest) iter.Seq2[*model.LLMResponse, error] {
 	aggregator := llminternal.NewStreamingResponseAggregator()
+	config := configPreservingEmptyTextThoughtSignatures(req.Config)
 
 	return func(yield func(*model.LLMResponse, error) bool) {
-		for resp, err := range m.client.Models.GenerateContentStream(ctx, m.modelName(req), req.Contents, req.Config) {
+		for resp, err := range m.client.Models.GenerateContentStream(ctx, m.modelName(req), req.Contents, config) {
 			if err != nil {
 				yield(nil, err)
 				return
@@ -157,6 +162,77 @@ func (m *geminiModel) generateStream(ctx context.Context, req *model.LLMRequest)
 			yield(closeResult, nil)
 		}
 	}
+}
+
+// configPreservingEmptyTextThoughtSignatures works around googleapis/go-genai#931.
+// The SDK omits an empty Part.Text when it converts a request to JSON, turning a
+// trailing text part from Gemini 3 into a part with a thought signature but no
+// data field. Restore the empty text in the request body without changing the
+// response part or its position in session history.
+//
+// Fork port of google/adk-go#1639 (unmerged upstream): Vertex intermittently
+// rejects the data-less part with 400 INVALID_ARGUMENT. Unlike upstream, a nil
+// config is treated as empty instead of being dereferenced.
+func configPreservingEmptyTextThoughtSignatures(config *genai.GenerateContentConfig) *genai.GenerateContentConfig {
+	if config == nil {
+		config = &genai.GenerateContentConfig{}
+	}
+	configCopy := *config
+	httpOptions := &genai.HTTPOptions{}
+	if config.HTTPOptions != nil {
+		*httpOptions = *config.HTTPOptions
+	}
+
+	provider := httpOptions.ExtrasRequestProvider
+	httpOptions.ExtrasRequestProvider = func(body map[string]any) map[string]any {
+		if provider != nil {
+			body = provider(body)
+		}
+		preserveEmptyTextThoughtSignatureParts(body)
+		return body
+	}
+	configCopy.HTTPOptions = httpOptions
+	return &configCopy
+}
+
+func preserveEmptyTextThoughtSignatureParts(body map[string]any) {
+	for _, content := range mapsFromSlice(body["contents"]) {
+		for _, part := range mapsFromSlice(content["parts"]) {
+			if _, hasSignature := part["thoughtSignature"]; !hasSignature || partHasData(part) {
+				continue
+			}
+			part["text"] = ""
+		}
+	}
+}
+
+func mapsFromSlice(value any) []map[string]any {
+	switch values := value.(type) {
+	case []map[string]any:
+		return values
+	case []any:
+		maps := make([]map[string]any, 0, len(values))
+		for _, value := range values {
+			if valueMap, ok := value.(map[string]any); ok {
+				maps = append(maps, valueMap)
+			}
+		}
+		return maps
+	default:
+		return nil
+	}
+}
+
+func partHasData(part map[string]any) bool {
+	for field := range part {
+		switch field {
+		case "audioTranscription", "mediaProcessing", "mediaResolution", "partMetadata", "thought", "thoughtSignature", "videoMetadata":
+			continue
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 // maybeAppendUserContent appends a user content, so that model can continue to output.
